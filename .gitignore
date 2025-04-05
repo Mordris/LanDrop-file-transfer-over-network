@@ -1,0 +1,37 @@
+# Python
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+*.so
+
+# Virtual environment
+venv/
+*.venv/
+env/
+*.env/
+ENV/
+*.ENV/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDE files (examples, add your own)
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Logs
+*.log
+
+# Other
+*.swp
+*~
+test.txt
