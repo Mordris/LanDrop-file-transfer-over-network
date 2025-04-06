@@ -5,6 +5,14 @@ from tkinter import messagebox
 import time
 import sys # For platform check
 
+# --- NEW: Conditional pyperclip import ---
+try:
+    import pyperclip
+except ImportError:
+    pyperclip = None
+    # Optional: print a warning here too, though AppLogic already does
+    # print("Warning (UI): 'pyperclip' not installed. Copy button in popup will be disabled.")
+
 # Use constants (assuming constants.py is accessible or values hardcoded if needed)
 try:
     from ..utils.constants import TRANSFER_TYPE_FILE, TRANSFER_TYPE_TEXT
@@ -344,13 +352,13 @@ class MainWindow:
 
     # --- NEW METHOD for Selectable Text Pop-up ---
     def show_selectable_text_popup(self, title, text_content):
-        """Creates a Toplevel window with selectable text. Must run in main thread."""
+        """Creates a Toplevel window with selectable text and a copy button."""
         print(f"UI Displaying selectable text: {title}")
         try:
             # Create the Toplevel window
             popup = tk.Toplevel(self.root)
             popup.title(title)
-            popup.geometry("450x300")
+            popup.geometry("450x300") # Keep initial size
             popup.minsize(300, 200)
 
             # Attempt to make it transient and modal
@@ -363,8 +371,8 @@ class MainWindow:
             # Add Widgets
             main_frame = ttk.Frame(popup, padding=10)
             main_frame.pack(expand=True, fill=tk.BOTH)
-            main_frame.rowconfigure(0, weight=1)
-            main_frame.columnconfigure(0, weight=1)
+            main_frame.rowconfigure(0, weight=1)    # Text area expands
+            main_frame.columnconfigure(0, weight=1) # Text area expands
 
             text_widget = scrolledtext.ScrolledText(
                 main_frame, wrap=tk.WORD, height=10, width=50, state=tk.NORMAL
@@ -373,24 +381,60 @@ class MainWindow:
             text_widget.insert(tk.END, text_content)
             text_widget.config(state=tk.DISABLED) # Make read-only after inserting
 
-            close_button = ttk.Button(main_frame, text="Close", command=popup.destroy)
-            close_button.grid(row=1, column=0, sticky="se", padx=5) # Align bottom-right
+            # --- Button Frame ---
+            button_frame = ttk.Frame(main_frame)
+            # Align the frame itself to the bottom-right
+            button_frame.grid(row=1, column=0, sticky="e")
+
+            # --- Copy Button Command ---
+            def _copy_to_clipboard():
+                if pyperclip:
+                    try:
+                        # Get text directly from the widget
+                        text_to_copy = text_widget.get("1.0", tk.END).strip()
+                        pyperclip.copy(text_to_copy)
+                        # Optional feedback: briefly change button text
+                        copy_button.config(text="Copied!", state=tk.DISABLED)
+                        popup.after(1500, lambda: copy_button.config(text="Copy", state=tk.NORMAL if pyperclip else tk.DISABLED))
+                    except Exception as e:
+                        # Show error relative to the popup
+                        messagebox.showerror("Clipboard Error", f"Could not copy text:\n{e}", parent=popup)
+                else:
+                    # Should not happen if button is disabled correctly, but belt-and-suspenders
+                    messagebox.showwarning("Clipboard Unavailable",
+                                           "Cannot copy text. 'pyperclip' module not installed.",
+                                           parent=popup)
+
+            # --- Create Buttons ---
+            copy_button = ttk.Button(
+                button_frame,
+                text="Copy",
+                command=_copy_to_clipboard,
+                # Disable button if pyperclip wasn't imported
+                state=(tk.NORMAL if pyperclip else tk.DISABLED)
+            )
+            # Pack buttons side-by-side within the button_frame
+            copy_button.pack(side=tk.LEFT, padx=(0, 5)) # Add padding between buttons
+
+            close_button = ttk.Button(button_frame, text="Close", command=popup.destroy)
+            close_button.pack(side=tk.LEFT)
+
 
             # Center the popup relative to the main window (optional)
-            popup.update_idletasks() # Ensure window size is calculated
-            root_x = self.root.winfo_x()
-            root_y = self.root.winfo_y()
-            root_w = self.root.winfo_width()
-            root_h = self.root.winfo_height()
-            popup_w = popup.winfo_width()
-            popup_h = popup.winfo_height()
+            # ... (centering code remains the same) ...
+            popup.update_idletasks()
+            root_x = self.root.winfo_x(); root_y = self.root.winfo_y()
+            root_w = self.root.winfo_width(); root_h = self.root.winfo_height()
+            popup_w = popup.winfo_width(); popup_h = popup.winfo_height()
             x = root_x + (root_w // 2) - (popup_w // 2)
             y = root_y + (root_h // 2) - (popup_h // 2)
             popup.geometry(f'+{x}+{y}')
 
+
             # Focus management
             popup.focus_set() # Focus the popup itself
-            text_widget.focus_set() # Focus the text widget for immediate selection/scrolling
+            # Keep focus on text widget initially for selection/scrolling
+            text_widget.focus_set()
 
             # Wait for the window to be closed (makes grab_set effective)
             self.root.wait_window(popup)
@@ -402,6 +446,7 @@ class MainWindow:
         except Exception as e:
             import traceback
             print(f"Unexpected error creating selectable text popup: {e}\n{traceback.format_exc()}")
+            # Fallback
             self.show_success(title, "[Error displaying popup]\n\n" + text_content)
 
     def update_progress(self, current_bytes, total_bytes, speed_bps, eta_sec):

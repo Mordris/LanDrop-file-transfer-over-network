@@ -435,7 +435,8 @@ class FileReceiver(TransferAgent):
                  except Exception:
                      pass
              if address in self.active_transfers: del self.active_transfers[address]
-             if addr_str in self.confirmation_results: del self.confirmation_results[addr_str] # Clean up confirmation results too
+                          # Access confirmation_results via the app_logic reference
+             if addr_str in self.app_logic.confirmation_results: del self.app_logic.confirmation_results[addr_str] # Clean up confirmation results via AppLogic
              print(f"Connection from {addr_str} closed.")
 
     def _cleanup_partial_file(self, filepath): # ... (remains the same) ...

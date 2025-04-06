@@ -1,2 +1,13 @@
+# requirements.txt for LanDrop
+
+# Core networking and discovery
 zeroconf>=0.47.0,<1.0
+
+# Optional: Clipboard functionality for received text snippets
+# Install if you want the 'Copy' button/auto-copy feature to work.
 pyperclip>=1.8.2,<2.0
+
+# Optional: Required ONLY for automatically generating self-signed TLS certificates
+# if TLS is enabled in the config AND certificate files are missing.
+# Not needed if TLS is disabled or you provide your own certs.
+cryptography>=3.4
