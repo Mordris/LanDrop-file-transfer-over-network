@@ -1,35 +1,37 @@
 import tkinter as tk
-from tkinter import ttk, scrolledtext
+from tkinter import ttk, scrolledtext # Use ttk Treeview
 from tkinter import filedialog
 from tkinter import messagebox
 import time
-import sys  # For platform check
-import os   # For basename
+import sys
+from pathlib import Path # For icon paths
+import os
+import traceback # For detailed error logging
 
-# Conditional pyperclip import for text popup copy button
+# --- PIL for icons ---
+try:
+    from PIL import Image, ImageTk
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+    # Warning printed in __init__
+
+# Conditional pyperclip
 try:
     import pyperclip
 except ImportError:
     pyperclip = None
-    # Optional: print a warning here too, though AppLogic already does
-    # print("Warning (UI): 'pyperclip' not installed. Copy button in popup will be disabled.")
 
 # Use constants
 try:
-    # Import relevant types, including MULTI_START for clarity if needed elsewhere
-    from ..utils.constants import TRANSFER_TYPE_FILE, TRANSFER_TYPE_TEXT, TRANSFER_TYPE_MULTI_START
+    from ..utils.constants import (TRANSFER_TYPE_FILE, TRANSFER_TYPE_TEXT,
+                            TRANSFER_TYPE_MULTI_START, ASSETS_DIR_NAME, ICONS_SUBDIR_NAME,
+                            OS_ICON_MAP, SERVICE_TYPE) # Import icon map and SERVICE_TYPE
 except ImportError:
-    # Fallback values if constants not found (less ideal)
-    TRANSFER_TYPE_FILE = "FILE"
-    TRANSFER_TYPE_TEXT = "TEXT"
-    TRANSFER_TYPE_MULTI_START = "MULTI_START" # Needed if logic refers to it
-
-# Map sys.platform to short codes for device list display
-OS_MAP = {
-    'win32': '[Win]',
-    'linux': '[Lin]',
-    'darwin': '[Mac]',
-}
+    # Fallbacks if constants import fails
+    TRANSFER_TYPE_FILE="FILE"; TRANSFER_TYPE_TEXT="TEXT"; TRANSFER_TYPE_MULTI_START="MULTI_START"
+    ASSETS_DIR_NAME="assets"; ICONS_SUBDIR_NAME="icons"; OS_ICON_MAP={}; SERVICE_TYPE="_landrop._tcp.local."
+    print("Warning (UI): Failed constants import. Icons/Splitting might fail.")
 
 
 class MainWindow:
@@ -37,604 +39,553 @@ class MainWindow:
 
     def __init__(self, root, controller):
         self.root = root
-        self.controller = controller
+        self.controller = controller # Instance of AppLogic
         self.root.title("LanDrop")
-        # Adjusted size for new buttons/label
-        self.root.geometry("550x600")
+        self.root.geometry("550x600") # WxH
         self.root.minsize(450, 500)
 
         # --- Styling ---
         style = ttk.Style(self.root)
-        try:
-            # Prefer themes that generally look better cross-platform
+        try: # Apply a preferred theme if available
             themes = style.theme_names()
-            if 'clam' in themes: style.theme_use('clam')
-            elif 'vista' in themes: style.theme_use('vista') # Good on Windows
-            elif 'aqua' in themes: style.theme_use('aqua') # Good on macOS
+            if 'clam' in themes:
+                style.theme_use('clam')
+            elif 'vista' in themes and sys.platform == 'win32':
+                 style.theme_use('vista')
+            elif 'aqua' in themes and sys.platform == 'darwin':
+                 style.theme_use('aqua')
+            # Add more theme preferences if desired
         except tk.TclError:
-            print("Could not set a preferred theme, using default.")
+            print("Warning: Could not set a preferred theme, using default.")
 
-        # --- Paned Window for Resizable Sections ---
+        # --- Load OS Icons ---
+        self.os_icons = {} # Stores PhotoImage objects {os_key: photo_img}
+        if not HAS_PIL:
+            print("Warning (UI): Pillow library not found (pip install Pillow). OS icons in device list will be disabled.")
+        self._load_os_icons()
+
+        # --- Main Layout: Paned Window ---
         self.paned_window = ttk.PanedWindow(self.root, orient=tk.VERTICAL)
         self.paned_window.pack(expand=True, fill=tk.BOTH, padx=5, pady=5)
 
         # --- Top Frame (Discovery & Actions) ---
         self.top_frame = ttk.Frame(self.paned_window, padding=5)
-        self.paned_window.add(self.top_frame, weight=3) # Give more initial space
+        self.paned_window.add(self.top_frame, weight=3) # Give more initial height
 
-        # Configure grid weights for resizing
-        self.top_frame.rowconfigure(1, weight=1) # Listbox row expands
-        self.top_frame.columnconfigure(0, weight=1) # Listbox column expands
-        self.top_frame.columnconfigure(1, weight=0) # Text input column fixed initially
+        # Grid configuration for resizing within top_frame
+        self.top_frame.rowconfigure(1, weight=1) # Device list row expands vertically
+        self.top_frame.columnconfigure(0, weight=1) # Device list column expands horizontally
+        self.top_frame.columnconfigure(1, weight=0) # Text input column has fixed initial width
 
-        # Device Discovery List
+        # --- Device Discovery List (ttk.Treeview) ---
         devices_label = ttk.Label(self.top_frame, text="Discovered Devices:")
         devices_label.grid(row=0, column=0, sticky=tk.W, pady=(0, 2))
 
-        listbox_frame = ttk.Frame(self.top_frame)
-        listbox_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 5))
-        listbox_frame.rowconfigure(0, weight=1)
-        listbox_frame.columnconfigure(0, weight=1)
-        scrollbar = ttk.Scrollbar(listbox_frame, orient=tk.VERTICAL)
-        self.devices_listbox = tk.Listbox(
-            listbox_frame,
-            height=8, # Adjust height as needed
-            yscrollcommand=scrollbar.set,
-            exportselection=False # Prevents selection clearing on focus loss
-        )
-        scrollbar.config(command=self.devices_listbox.yview)
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        self.devices_listbox.grid(row=0, column=0, sticky="nsew")
-        self.devices_listbox.bind('<<ListboxSelect>>', self._on_device_select_ui)
+        tree_frame = ttk.Frame(self.top_frame) # Frame to hold treeview + scrollbar
+        tree_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 5))
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
 
-        # Text Input Area
+        scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL)
+        self.devices_tree = ttk.Treeview(
+            tree_frame,
+            columns=('device_name',), # Define data columns (only one needed for name)
+            show='tree headings', # Show icon column (#0) + data column headings
+            yscrollcommand=scrollbar.set,
+            selectmode='browse' # Allow only single selection
+        )
+        scrollbar.config(command=self.devices_tree.yview)
+
+        # Define column headings and appearance
+        self.devices_tree.heading('#0', text='OS', anchor=tk.W) # Tree column for icon
+        self.devices_tree.heading('device_name', text='Device Name', anchor=tk.W)
+
+        self.devices_tree.column('#0', width=35, minwidth=30, stretch=tk.NO, anchor=tk.CENTER) # Icon column fixed width
+        self.devices_tree.column('device_name', anchor=tk.W, stretch=tk.YES) # Name column expands
+
+        # Place Treeview and Scrollbar in grid
+        self.devices_tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
+        # Event binding for selection changes
+        self.devices_tree.bind('<<TreeviewSelect>>', self._on_device_select_ui)
+        # Dictionary to map Treeview item IDs to full Zeroconf service names
+        self.tree_item_to_service_name = {}
+
+        # --- Text Input Area ---
         text_input_frame = ttk.LabelFrame(self.top_frame, text="Text Snippet", padding=5)
-        text_input_frame.grid(row=1, column=1, sticky="nsew", pady=(0,0)) # Expand vertically
+        text_input_frame.grid(row=1, column=1, sticky="nsew") # Expand vertically and horizontally if needed
         text_input_frame.rowconfigure(0, weight=1)
         text_input_frame.columnconfigure(0, weight=1)
-
-        self.text_input = scrolledtext.ScrolledText(
-            text_input_frame, height=5, width=25, wrap=tk.WORD
-        )
+        self.text_input = scrolledtext.ScrolledText(text_input_frame, height=5, width=25, wrap=tk.WORD)
         self.text_input.grid(row=0, column=0, sticky="nsew")
-        # Update state when text changes
         self.text_input.bind("<KeyRelease>", self._on_text_change)
 
-        # Selection Status Label (Shows what's selected: files, folder, or text)
-        self.selection_label = ttk.Label(self.top_frame, text="Nothing selected", wraplength=300) # Wraps long paths
+        # --- Selection Status Label ---
+        self.selection_label = ttk.Label(self.top_frame, text="Nothing selected", wraplength=300) # Wraps if text too long
         self.selection_label.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(5, 2))
 
-        # Action Buttons Frame (File/Folder/Text Send/Cancel)
+        # --- Action Buttons Frame ---
         action_frame = ttk.Frame(self.top_frame)
-        # Place below the selection label
         action_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(2, 0))
-
-        # --- Selection Buttons ---
-        self.select_files_button = ttk.Button(
-            action_frame, text="Select Files...", command=self._select_files_ui
-        )
+        # Selection Buttons
+        self.select_files_button = ttk.Button(action_frame, text="Select Files...", command=self._select_files_ui)
         self.select_files_button.pack(side=tk.LEFT, padx=(0, 5))
-
-        self.select_folder_button = ttk.Button(
-            action_frame, text="Select Folder...", command=self._select_folder_ui
-        )
+        self.select_folder_button = ttk.Button(action_frame, text="Select Folder...", command=self._select_folder_ui)
         self.select_folder_button.pack(side=tk.LEFT, padx=(0, 5))
-
-        # --- Send/Cancel Buttons ---
-        self.send_button = ttk.Button(
-            action_frame, text="Send ->", command=self._send_data_ui,
-            state=tk.DISABLED # Initially disabled
-        )
+        # Send/Cancel Buttons
+        self.send_button = ttk.Button(action_frame, text="Send ->", command=self._send_data_ui, state=tk.DISABLED)
         self.send_button.pack(side=tk.LEFT, padx=(0, 5))
-
-        self.cancel_button = ttk.Button(
-            action_frame, text="Cancel", command=self._cancel_transfer_ui,
-            state=tk.DISABLED # Enabled only during transfer
-        )
+        self.cancel_button = ttk.Button(action_frame, text="Cancel", command=self._cancel_transfer_ui, state=tk.DISABLED)
         self.cancel_button.pack(side=tk.LEFT, padx=(0, 5))
 
-        # Progress Bar
-        self.progress_bar = ttk.Progressbar(
-            self.top_frame, orient=tk.HORIZONTAL, length=100, mode='determinate'
-        )
-        # Place below action buttons
+        # --- Progress Bar ---
+        self.progress_bar = ttk.Progressbar(self.top_frame, orient=tk.HORIZONTAL, length=100, mode='determinate')
         self.progress_bar.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(5, 5))
         self.progress_bar['value'] = 0
 
         # --- Bottom Frame (History) ---
         self.bottom_frame = ttk.LabelFrame(self.paned_window, text="History", padding=5)
-        self.paned_window.add(self.bottom_frame, weight=1) # Less initial space
-
-        self.bottom_frame.rowconfigure(0, weight=1)
-        self.bottom_frame.columnconfigure(0, weight=1)
-
-        self.history_text = scrolledtext.ScrolledText(
-            self.bottom_frame, height=6, width=60, wrap=tk.WORD, state=tk.DISABLED
-        )
+        self.paned_window.add(self.bottom_frame, weight=1) # Give less initial height
+        self.bottom_frame.rowconfigure(0, weight=1); self.bottom_frame.columnconfigure(0, weight=1)
+        self.history_text = scrolledtext.ScrolledText(self.bottom_frame, height=6, width=60, wrap=tk.WORD, state=tk.DISABLED)
         self.history_text.grid(row=0, column=0, sticky="nsew")
 
-        # --- Status Bar (outside PanedWindow) ---
-        self.status_label = ttk.Label(
-            self.root, text="Status: Initializing...",
-            relief=tk.SUNKEN, anchor=tk.W, padding="2 5"
-        )
+        # --- Status Bar ---
+        self.status_label = ttk.Label(self.root, text="Status: Initializing...", relief=tk.SUNKEN, anchor=tk.W, padding="2 5")
         self.status_label.pack(side=tk.BOTTOM, fill=tk.X)
 
-        # Store last explicit selection type ('files', 'folder', 'text')
-        # Used to help determine intent if multiple things *could* be selected
-        self.last_explicit_selection_type = None
+        # Internal state tracking for UI logic
+        self.last_explicit_selection_type = None # 'files', 'folder', or 'text'
 
-        # Handle window close event
+        # Window close handling
         self.root.protocol("WM_DELETE_WINDOW", self._handle_close_request)
 
-    # --- Helper Methods for Formatting ---
+    def _load_os_icons(self):
+        """Loads OS icons using Pillow if available."""
+        if not HAS_PIL:
+            return # Skip if Pillow not installed
+
+        try:
+            # Determine path relative to this ui module file
+            script_dir = Path(__file__).parent.resolve()
+            # Assumes structure: landrop/ui/main_window.py -> landrop/assets/icons/
+            assets_path = script_dir.parent / ASSETS_DIR_NAME / ICONS_SUBDIR_NAME
+            print(f"UI: Loading OS icons from: {assets_path}")
+
+            if not assets_path.is_dir():
+                 print(f"Warning: Assets/Icons directory not found at {assets_path}")
+                 return
+
+            for os_key, filename in OS_ICON_MAP.items():
+                icon_path = assets_path / filename
+                if icon_path.is_file():
+                    try:
+                        # Open with Pillow, resize (e.g., 16x16), create PhotoImage
+                        # Use LANCZOS for high-quality downscaling
+                        img = Image.open(icon_path).resize((16, 16), Image.Resampling.LANCZOS)
+                        # Store the PhotoImage object, keyed by the OS identifier
+                        self.os_icons[os_key] = ImageTk.PhotoImage(img)
+                        # print(f"  Loaded icon: {os_key}")
+                    except Exception as e:
+                        print(f"  Error loading/processing icon '{filename}': {e}")
+                elif os_key != 'unknown': # Don't warn if the fallback is missing (but check later)
+                     print(f"  Warning: Icon file not found: {icon_path}")
+
+            # Ensure the essential fallback 'unknown' icon loaded
+            if 'unknown' not in self.os_icons:
+                print("ERROR: Fallback 'unknown.png' icon is missing or failed to load from assets.")
+                # Consider creating a dummy placeholder image here if needed
+
+        except Exception as e:
+            print(f"Error finding/loading OS icons folder: {e}")
+            traceback.print_exc()
+            self.os_icons = {} # Clear icons dictionary on major error
+
+    # --- Helper Formatting Methods ---
     def _format_speed(self, bytes_per_second):
-        if bytes_per_second < 1024: return f"{bytes_per_second:.1f} B/s"
-        elif bytes_per_second < 1024**2: return f"{bytes_per_second/1024:.1f} KB/s"
-        elif bytes_per_second < 1024**3: return f"{bytes_per_second/1024**2:.1f} MB/s"
-        else: return f"{bytes_per_second/1024**3:.1f} GB/s"
+        """Formats speed in B/s, KB/s, MB/s, or GB/s."""
+        if bytes_per_second < 1024:
+            return f"{bytes_per_second:.1f} B/s"
+        elif bytes_per_second < 1024**2:
+            return f"{bytes_per_second/1024:.1f} KB/s"
+        elif bytes_per_second < 1024**3:
+            return f"{bytes_per_second/1024**2:.1f} MB/s"
+        else:
+            return f"{bytes_per_second/1024**3:.1f} GB/s"
 
     def _format_eta(self, seconds):
-        if seconds < 0 or seconds > 3600 * 24 * 7: # Avoid nonsensical ETAs (e.g., > 1 week)
+        """Formats ETA in H:MM:SS or MM:SS."""
+        if not isinstance(seconds, (int, float)) or seconds < 0 or seconds > 3600 * 24 * 7: # Limit to 1 week
             return "--:--"
         try:
-            (mins, secs) = divmod(int(seconds), 60)
-            (hours, mins) = divmod(mins, 60)
-            if hours > 0: return f"{hours:d}:{mins:02d}:{secs:02d}"
-            else: return f"{mins:02d}:{secs:02d}"
-        except Exception: return "--:--" # Catch potential math errors
+            seconds_int = int(seconds)
+            mins, secs = divmod(seconds_int, 60)
+            hours, mins = divmod(mins, 60)
+            if hours > 0:
+                return f"{hours:d}:{mins:02d}:{secs:02d}"
+            else:
+                return f"{mins:02d}:{secs:02d}"
+        except Exception:
+            return "--:--" # Fallback on calculation error
 
     def _format_size(self, size_bytes):
-        if size_bytes < 1024: return f"{size_bytes} B"
-        elif size_bytes < 1024**2: return f"{size_bytes/1024:.1f} KB"
-        elif size_bytes < 1024**3: return f"{size_bytes/1024**2:.2f} MB"
-        else: return f"{size_bytes/1024**3:.2f} GB"
+        """Formats size in B, KB, MB, or GB."""
+        if size_bytes < 1024:
+            return f"{size_bytes} B"
+        elif size_bytes < 1024**2:
+            return f"{size_bytes/1024:.1f} KB"
+        elif size_bytes < 1024**3:
+            return f"{size_bytes/1024**2:.2f} MB"
+        else:
+            return f"{size_bytes/1024**3:.2f} GB"
 
     # --- Private UI Event Handlers ---
     def _select_files_ui(self):
         """Handles 'Select Files...' button click."""
         filepaths = filedialog.askopenfilenames(title="Select Files to Send")
-        if filepaths:
+        if filepaths: # User selected one or more files
             self.last_explicit_selection_type = 'files'
-            # Clear other selections in UI and notify controller
-            if hasattr(self, 'text_input'): self.text_input.delete('1.0', tk.END)
-            self.controller.handle_folder_selection(None)
-            # Update display and notify controller about new file selection
-            self.update_selection_display(f"{len(filepaths)} files selected")
-            self.controller.handle_files_selection(filepaths)
-        # else: User cancelled dialog, do nothing, keep previous selection
+            if hasattr(self, 'text_input'):
+                self.text_input.delete('1.0', tk.END) # Clear text input
+            self.controller.handle_folder_selection(None) # Clear folder selection state
+            self.update_selection_display(f"{len(filepaths)} files selected") # Update UI label
+            self.controller.handle_files_selection(filepaths) # Notify controller
+        # else: User cancelled the dialog
         self.reset_progress() # Reset progress bar regardless
 
     def _select_folder_ui(self):
         """Handles 'Select Folder...' button click."""
-        folderpath = filedialog.askdirectory(title="Select Folder to Send")
-        if folderpath:
+        folderpath = filedialog.askdirectory(title="Select Folder to Send", mustexist=True)
+        if folderpath: # User selected a folder
             self.last_explicit_selection_type = 'folder'
-            # Clear other selections in UI and notify controller
-            if hasattr(self, 'text_input'): self.text_input.delete('1.0', tk.END)
-            self.controller.handle_files_selection(None)
-            # Update display and notify controller about new folder selection
-            folder_name = os.path.basename(folderpath) if folderpath else "Selected Folder"
-            self.update_selection_display(f"Folder: {folder_name}")
-            self.controller.handle_folder_selection(folderpath)
-        # else: User cancelled dialog, do nothing, keep previous selection
+            if hasattr(self, 'text_input'):
+                self.text_input.delete('1.0', tk.END) # Clear text input
+            self.controller.handle_files_selection(None) # Clear files selection state
+            folder_name = os.path.basename(folderpath) or folderpath # Get folder name
+            self.update_selection_display(f"Folder: {folder_name}") # Update UI label
+            self.controller.handle_folder_selection(folderpath) # Notify controller
+        # else: User cancelled the dialog
         self.reset_progress() # Reset progress bar regardless
 
     def _on_text_change(self, event=None):
         """Handles text input changes, potentially clearing other selections."""
         if hasattr(self, 'text_input'):
-            text_content = self.text_input.get("1.0", tk.END).strip()
-            if text_content:
-                # If user actively types, make text the primary selection
-                if self.last_explicit_selection_type != 'text':
-                    self.last_explicit_selection_type = 'text'
-                    # Clear file/folder state in controller and update display
-                    self.controller.handle_files_selection(None)
-                    self.controller.handle_folder_selection(None)
-                    self.update_selection_display("Text snippet entered")
-            # Always check button state after text change
-            self.controller.check_send_button_state_external()
-        else:
-            print("Warning: _on_text_change called but text_input widget doesn't exist.")
+            try:
+                text_content = self.text_input.get("1.0", tk.END).strip()
+                if text_content:
+                    # If user actively types, assume text is the intended selection
+                    if self.last_explicit_selection_type != 'text':
+                        self.last_explicit_selection_type = 'text'
+                        # Clear other selections in the controller
+                        self.controller.handle_files_selection(None)
+                        self.controller.handle_folder_selection(None)
+                        self.update_selection_display("Text snippet entered") # Update UI label
+                # Always update button states after text changes
+                self.controller.check_send_button_state_external()
+            except tk.TclError: pass # Ignore if widget is being destroyed
 
     def _on_device_select_ui(self, event=None):
-        """Handles listbox selection and notifies controller."""
-        selected_indices = self.devices_listbox.curselection()
-        if selected_indices:
-            try:
-                # Extract only the name part, ignoring the OS tag
-                full_display_name = self.devices_listbox.get(selected_indices[0])
-                tag_index = full_display_name.rfind(' [')
-                selected_name = full_display_name[:tag_index] if tag_index != -1 else full_display_name
-                self.controller.handle_device_selection(selected_name)
-            except tk.TclError:
-                 # Handle error if list is modified during selection
+        """Handles Treeview selection change."""
+        selected_items = self.devices_tree.selection() # Returns tuple of selected item IDs
+        if selected_items:
+            item_id = selected_items[0] # Get the first (should only be one)
+            # Retrieve the full service name associated with this item ID
+            full_service_name = self.tree_item_to_service_name.get(item_id)
+            if full_service_name:
+                # Extract the display name part before the service type suffix
+                try:
+                    display_name = full_service_name.split(f'.{SERVICE_TYPE}')[0]
+                    self.controller.handle_device_selection(display_name) # Notify controller
+                except IndexError: # If split fails unexpectedly
+                     print(f"Warning: Could not parse display name from '{full_service_name}'")
+                     self.controller.handle_device_selection(None)
+            else:
+                 print(f"Warning: No service name found mapping for Treeview item '{item_id}'")
                  self.controller.handle_device_selection(None)
         else:
-            # Notify controller that selection was cleared
+            # No item selected
             self.controller.handle_device_selection(None)
 
     def _send_data_ui(self):
-        """
-        Determine what to send (files, folder, text) based on controller state,
-        disable the Send button immediately, and initiate the send request.
-        Re-enables Send button if validation fails before sending.
-        """
-
-        # --- Immediately Disable Send Button ---
-        # Prevent rapid re-clicks before controller state updates the UI.
-        can_proceed = True # Flag to track if we should proceed
-        try:
+        """Initiates send request after disabling Send button."""
+        can_proceed = True
+        try: # Immediately disable button
             if hasattr(self, 'send_button') and self.send_button.winfo_exists():
-                # Check current state to avoid unnecessary config calls if already disabled
                 if str(self.send_button.cget('state')) != str(tk.DISABLED):
                     self.send_button.config(state=tk.DISABLED)
-            else:
-                # If button doesn't exist, we can't proceed reliably
-                can_proceed = False
-                print("Warning: Send button not found in _send_data_ui.")
+            else: can_proceed = False
+        except tk.TclError: can_proceed = False # Window closing
 
-        except tk.TclError:
-             # Window might be closing
-             can_proceed = False
+        if not can_proceed: return
 
-        # If button disable failed or button doesn't exist, exit early
-        if not can_proceed:
-            return
+        # Determine what to send based on controller state
+        stype, item = None, None
+        sf=self.controller.selected_filepaths; sd=self.controller.selected_folderpath; st=self.controller.selected_text
+        if sf: stype = TRANSFER_TYPE_FILE if len(sf)==1 else TRANSFER_TYPE_MULTI_START; item = sf[0] if stype==TRANSFER_TYPE_FILE else sf; print(f"DBG UI: Send {stype}")
+        elif sd: stype = TRANSFER_TYPE_MULTI_START; item = sd; print("DBG UI: Send FOLDER")
+        elif st: stype = TRANSFER_TYPE_TEXT; item = st; print("DBG UI: Send TEXT")
 
-        # --- Determine What to Send ---
-        send_type = None
-        item_to_send = None
-
-        # Get current selection state directly from the controller
-        # This ensures we use the authoritative state, not just the UI widgets' content.
-        selected_files = self.controller.selected_filepaths
-        selected_folder = self.controller.selected_folderpath
-        text_content = self.controller.selected_text # Use text from controller state
-
-        # Determine transfer type and item based on controller state
-        # Priority: Files > Folder > Text (adjust if needed)
-        if selected_files:
-            if len(selected_files) == 1:
-                # Exactly one file selected via "Select Files..." -> Single file transfer
-                send_type = TRANSFER_TYPE_FILE
-                item_to_send = selected_files[0] # Send the single path string
-                print("DEBUG UI: Sending as SINGLE FILE")
-            else:
-                # Multiple files selected -> Multi-file transfer
-                send_type = TRANSFER_TYPE_MULTI_START
-                item_to_send = selected_files # Send the list/tuple of paths
-                print("DEBUG UI: Sending as MULTI FILES")
-        elif selected_folder:
-            # Folder selected -> Multi-file transfer (folder contents)
-            send_type = TRANSFER_TYPE_MULTI_START
-            item_to_send = selected_folder # Send the folder path string
-            print("DEBUG UI: Sending as FOLDER")
-        elif text_content:
-            # Text entered and active -> Text transfer
-            send_type = TRANSFER_TYPE_TEXT
-            item_to_send = text_content # Send the text string
-            print("DEBUG UI: Sending as TEXT")
-
-        # --- Initiate Send or Handle Failure ---
-        if send_type and item_to_send:
-             # Valid item selected, proceed with send request
-             self.reset_progress() # Clear progress bar
-             # Controller will set is_transfer_active and manage button state via updates
-             self.controller.handle_send_request(item_to_send, send_type)
+        # Proceed if valid, else show error and re-enable button
+        if stype and item:
+             self.reset_progress()
+             self.controller.handle_send_request(item, stype)
         else:
-             # No valid item was determined (e.g., selection cleared between clicks)
-             # Show an error message
-             self.show_error("Send Error", "Select files, a folder, or enter text to send.")
-
-             # --- Re-enable Send Button on Validation Failure ---
-             # Since we disabled it at the start but didn't actually start a transfer,
-             # we need to re-enable it here.
-             try:
-                 if hasattr(self, 'send_button') and self.send_button.winfo_exists():
-                      # Only re-enable if controller confirms no transfer is active
-                      # (Safer check than just assuming) - Although controller state might
-                      # not have updated yet if error is very fast. Let's just enable.
-                      self.send_button.config(state=tk.NORMAL)
-             except tk.TclError:
-                  pass # Window might be closing
-             except Exception as e:
-                  print(f"Error re-enabling send button after validation fail: {e}")
+             self.show_error("Send Error","Select files, folder, or enter text to send.")
+             try: # Re-enable button
+                 if hasattr(self, 'send_button') and self.send_button.winfo_exists(): self.send_button.config(state=tk.NORMAL)
+             except Exception as e: print(f"Err re-enable send button: {e}")
 
     def _cancel_transfer_ui(self):
-        """Notify controller to cancel the current transfer."""
+        """Handles 'Cancel' button click."""
         self.controller.handle_cancel_request()
 
     def _handle_close_request(self):
-        """Called when user clicks the window close button."""
+        """Handles window close ('X') button click."""
         print("UI: Close button clicked. Requesting shutdown...")
         self.controller.handle_shutdown()
 
     # --- Public Methods (called by Controller via root.after) ---
     def update_status(self, message):
         """Updates the text in the status bar."""
-        # Ensure this runs in the main thread (controller should use root.after)
-        self.status_label.config(text=f"Status: {message}")
+        try:
+            if hasattr(self, 'status_label') and self.status_label.winfo_exists():
+                self.status_label.config(text=f"Status: {message}")
+        except tk.TclError: pass # Ignore if UI is closing
 
     def update_selection_display(self, message):
         """Updates the label showing the current selection."""
-        # Ensure this runs in the main thread
-        self.selection_label.config(text=message)
+        try:
+            if hasattr(self, 'selection_label') and self.selection_label.winfo_exists():
+                self.selection_label.config(text=message)
+        except tk.TclError: pass
 
-    def update_device_list(self, action, display_name, os_info=""):
-        """Adds or removes a device display name from the listbox."""
-        if not display_name: return # Ignore empty names
+    def update_device_list(self, action, display_name, os_info="unknown"):
+        """Adds or removes a device from the Treeview list with OS icon."""
+        if not display_name: return
 
-        # Add OS tag for display
-        os_tag = OS_MAP.get(os_info, f"[{os_info[:3]}]" if os_info else "")
-        full_display_name = f"{display_name} {os_tag}".strip()
+        # Determine appropriate icon based on os_info string
+        os_key_mapped = 'unknown' # Default to unknown icon key
+        for key_pattern in OS_ICON_MAP.keys():
+             if os_info.lower().startswith(key_pattern):
+                  os_key_mapped = key_pattern
+                  break # Use first match
+        # Get the PhotoImage object, fallback to 'unknown' if specific or fallback missing
+        icon_image = self.os_icons.get(os_key_mapped, self.os_icons.get('unknown')) if HAS_PIL else None
+
+        # Construct full service name for internal mapping
+        full_service_name = f"{display_name}.{SERVICE_TYPE}"
 
         try:
-            # Check if listbox exists before operating on it
-            if not hasattr(self, 'devices_listbox') or not self.devices_listbox.winfo_exists():
-                 return # Exit if widget is gone (e.g., during shutdown)
+            # Ensure treeview exists
+            if not hasattr(self, 'devices_tree') or not self.devices_tree.winfo_exists(): return
 
-            items = list(self.devices_listbox.get(0, tk.END))
-            current_selection_index = self.devices_listbox.curselection()
-            current_selection_full_name = self.devices_listbox.get(current_selection_index[0]) if current_selection_index else None
+            # Find if item already exists using the service name mapping
+            existing_item_id = None
+            for item_id, service_name in self.tree_item_to_service_name.items():
+                 if service_name == full_service_name:
+                      existing_item_id = item_id
+                      break
 
             if action == "add":
-                # Only add if the exact full name isn't already present
-                if full_display_name not in items:
-                    self.devices_listbox.insert(tk.END, full_display_name)
-            elif action == "remove":
-                # Find index based on display_name to handle tag inconsistencies
-                found_idx = -1
-                item_to_remove_full_name = None
-                for idx, item in enumerate(items):
-                    # Check if item starts with the base name + space + bracket or is exact match
-                    if item.startswith(display_name + " [") or item == display_name:
-                        found_idx = idx
-                        item_to_remove_full_name = item # Store the actual item name being removed
-                        break
+                # Values tuple must match the `columns` definition of Treeview
+                item_values = (display_name,)
+                if existing_item_id is None:
+                    # Insert new item at the end of the root level ('')
+                    item_id = self.devices_tree.insert(
+                        parent='', index=tk.END,
+                        text='', # Text in tree column (#0) is unused here
+                        image=icon_image, # OS icon in tree column
+                        values=item_values, # Device name in 'device_name' column
+                        tags=('device_row',) # Optional tag for styling
+                    )
+                    # Store the mapping from the new item ID to the full service name
+                    self.tree_item_to_service_name[item_id] = full_service_name
+                else:
+                     # Item already exists, update its display (icon/name if needed)
+                     self.devices_tree.item(existing_item_id, image=icon_image, values=item_values)
 
-                if found_idx != -1:
-                    self.devices_listbox.delete(found_idx)
-                    # If the *actual* removed item was the selected one, clear controller state
-                    if item_to_remove_full_name == current_selection_full_name:
+            elif action == "remove":
+                if existing_item_id is not None:
+                    # Check if the item to be removed is currently selected
+                    is_selected = existing_item_id in self.devices_tree.selection()
+                    # Delete from Treeview
+                    self.devices_tree.delete(existing_item_id)
+                    # Delete from internal mapping
+                    del self.tree_item_to_service_name[existing_item_id]
+                    # If removed item was selected, clear controller's selection state
+                    if is_selected:
                         self.controller.handle_device_selection(None)
 
-        except tk.TclError as e:
-            # Expected error if window is closing during update
-            pass # print(f"TclError updating device list (window closed?): {e}")
-        except Exception as e:
-            print(f"Unexpected error updating device list: {e}")
+        except tk.TclError: pass # Ignore errors during shutdown
+        except Exception as e: print(f"Err update device tree: {e}\n{traceback.format_exc()}")
 
     def update_button_states(self, send_enabled, cancel_enabled):
-         """Updates Send/Cancel/Select button states based on controller logic."""
+         """Updates state of Send/Cancel/Select buttons based on controller logic."""
          try:
-             new_send_state = tk.NORMAL if send_enabled else tk.DISABLED
-             new_cancel_state = tk.NORMAL if cancel_enabled else tk.DISABLED
+             # Determine desired states
+             send_state = tk.NORMAL if send_enabled else tk.DISABLED
+             cancel_state = tk.NORMAL if cancel_enabled else tk.DISABLED
+             edit_state = tk.NORMAL if not cancel_enabled else tk.DISABLED # Can edit/select only if not transferring
+             text_state = tk.NORMAL if not cancel_enabled else tk.DISABLED
 
-             # Check widget existence before configuring (robustness during shutdown)
+             # --- CORRECTED WIDGET CHECKS ---
+             # Update widgets only if their state needs to change and they exist
+             # Check each widget explicitly using its known attribute name
+
              if hasattr(self, 'send_button') and self.send_button.winfo_exists():
-                 if self.send_button.cget('state') != new_send_state:
-                      self.send_button.config(state=new_send_state)
-             if hasattr(self, 'cancel_button') and self.cancel_button.winfo_exists():
-                 if self.cancel_button.cget('state') != new_cancel_state:
-                      self.cancel_button.config(state=new_cancel_state)
+                 if str(self.send_button.cget('state')) != str(send_state):
+                     self.send_button.config(state=send_state)
 
-             # Enable/disable selection buttons and text input based on whether a transfer is active
-             edit_state = tk.NORMAL if not cancel_enabled else tk.DISABLED
-             text_edit_state = tk.NORMAL if not cancel_enabled else tk.DISABLED
+             if hasattr(self, 'cancel_button') and self.cancel_button.winfo_exists():
+                 if str(self.cancel_button.cget('state')) != str(cancel_state):
+                      self.cancel_button.config(state=cancel_state)
 
              if hasattr(self, 'select_files_button') and self.select_files_button.winfo_exists():
-                 if self.select_files_button.cget('state') != edit_state:
+                  if str(self.select_files_button.cget('state')) != str(edit_state):
                      self.select_files_button.config(state=edit_state)
+
              if hasattr(self, 'select_folder_button') and self.select_folder_button.winfo_exists():
-                 if self.select_folder_button.cget('state') != edit_state:
+                  if str(self.select_folder_button.cget('state')) != str(edit_state):
                      self.select_folder_button.config(state=edit_state)
 
              if hasattr(self, 'text_input') and self.text_input.winfo_exists():
-                 current_text_state = self.text_input.cget('state')
-                 # Ensure state is compared as string ('normal' vs tk.NORMAL)
-                 if str(current_text_state) != str(text_edit_state):
-                     self.text_input.config(state=text_edit_state)
+                  # Ensure we compare strings for state ('normal' vs tk.NORMAL)
+                  if str(self.text_input.cget('state')) != str(text_state):
+                     self.text_input.config(state=text_state)
+             # --- END CORRECTION ---
 
-         except tk.TclError: pass # Window might be closing
-         except Exception as e: print(f"Unexpected error updating button states: {e}")
-
+         except tk.TclError:
+             pass # Ignore errors during window destruction
+         except Exception as e:
+             print(f"Unexpected error updating button states: {e}")
+             traceback.print_exc() # Print traceback for unexpected errors
+             
     def show_error(self, title, message):
-        """Displays an error message box."""
+        """Displays an error message box via main thread."""
         print(f"UI Error: {title} - {message}")
         try:
-            # Ensure messagebox runs in main thread
-            self.root.after(0, lambda t=title, m=message: messagebox.showerror(t, m))
-        except Exception as e: print(f"Failed to show error messagebox: {e}")
-        # Reset progress on error
-        self.reset_progress()
+            # Ensure runs in main thread, modal to root
+            self.root.after(0, lambda t=title, m=message: messagebox.showerror(t, m, parent=self.root))
+        except Exception as e:
+            print(f"Failed to show error messagebox: {e}")
+        self.reset_progress() # Always reset progress on error
 
     def show_success(self, title, message):
-         """Displays a success/info message box (for non-text items)."""
+         """Displays a success/info message box via main thread."""
          print(f"UI Success: {title} - {message}")
          try:
-             # Ensure messagebox runs in main thread
-             self.root.after(0, lambda t=title, m=message: messagebox.showinfo(t, m))
-         except Exception as e: print(f"Failed to show info messagebox: {e}")
-         # Reset progress on success
-         self.reset_progress()
+             # Ensure runs in main thread, modal to root
+             self.root.after(0, lambda t=title, m=message: messagebox.showinfo(t, m, parent=self.root))
+         except Exception as e:
+             print(f"Failed to show success messagebox: {e}")
+         self.reset_progress() # Always reset progress on success
 
     def ask_confirmation(self, title, message):
-         """Shows a yes/no dialog. Must be called from main thread."""
-         # AppLogic calls this via root.after, ensuring it's in the main thread
-         return messagebox.askyesno(title, message)
+         """Shows a yes/no dialog. Called from main thread by AppLogic."""
+         # Ensure modal to root window
+         return messagebox.askyesno(title, message, parent=self.root)
 
     def show_selectable_text_popup(self, title, text_content):
-        """Creates a Toplevel window with selectable text and a copy button."""
-        print(f"UI Displaying selectable text: {title}")
+        """Creates a Toplevel window with selectable text and copy button."""
+        print(f"UI Displaying selectable text popup: {title}")
         try:
-            # Create the Toplevel window
             popup = tk.Toplevel(self.root)
             popup.title(title)
-            popup.geometry("450x300") # Initial size
-            popup.minsize(300, 200)
+            popup.geometry("450x300"); popup.minsize(300, 200)
+            try: popup.transient(self.root) # Associate with main window
+            except tk.TclError: pass
+            popup.grab_set() # Make modal
 
-            # Attempt to make it transient (relative to main window) and modal
-            try: popup.transient(self.root)
-            except tk.TclError: print("Warning: Could not make text popup transient.")
-            popup.grab_set() # Make it modal
+            main_frame = ttk.Frame(popup, padding=10); main_frame.pack(expand=True, fill=tk.BOTH)
+            main_frame.rowconfigure(0, weight=1); main_frame.columnconfigure(0, weight=1)
 
-            # --- Widgets ---
-            main_frame = ttk.Frame(popup, padding=10)
-            main_frame.pack(expand=True, fill=tk.BOTH)
-            main_frame.rowconfigure(0, weight=1)    # Text area expands
-            main_frame.columnconfigure(0, weight=1) # Text area expands
-
-            text_widget = scrolledtext.ScrolledText(
-                main_frame, wrap=tk.WORD, height=10, width=50, state=tk.NORMAL
-            )
+            text_widget = scrolledtext.ScrolledText(main_frame, wrap=tk.WORD, height=10, width=50)
             text_widget.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
-            text_widget.insert(tk.END, text_content)
-            text_widget.config(state=tk.DISABLED) # Make read-only after inserting
+            text_widget.insert(tk.END, text_content); text_widget.config(state=tk.DISABLED) # Read-only
 
-            # Button Frame (for Copy and Close)
-            button_frame = ttk.Frame(main_frame)
-            # Align the frame itself to the bottom-right using grid's sticky
-            button_frame.grid(row=1, column=0, sticky="e") # East alignment
+            button_frame = ttk.Frame(main_frame); button_frame.grid(row=1, column=0, sticky="e") # Align buttons right
 
-            # Copy Button Command
+            # Inner function for copy command
             def _copy_to_clipboard():
                 if pyperclip:
                     try:
-                        # Get text directly from the widget
-                        text_to_copy = text_widget.get("1.0", tk.END).strip()
-                        pyperclip.copy(text_to_copy)
-                        # Provide visual feedback
-                        copy_button.config(text="Copied!", state=tk.DISABLED)
-                        # Reset button after a delay
-                        popup.after(1500, lambda: copy_button.config(text="Copy", state=tk.NORMAL if pyperclip else tk.DISABLED))
-                    except Exception as e:
-                        messagebox.showerror("Clipboard Error", f"Could not copy text:\n{e}", parent=popup)
-                else:
-                    messagebox.showwarning("Clipboard Unavailable",
-                                           "Cannot copy text. 'pyperclip' module not installed.",
-                                           parent=popup)
+                        pyperclip.copy(text_widget.get("1.0", tk.END).strip())
+                        copy_button.config(text="Copied!", state=tk.DISABLED) # Feedback
+                        popup.after(1500, lambda: copy_button.config(text="Copy", state=tk.NORMAL if pyperclip else tk.DISABLED)) # Reset
+                    except Exception as e: messagebox.showerror("Clipboard Error", f"Could not copy:\n{e}", parent=popup)
+                else: messagebox.showwarning("Clipboard Unavailable", "'pyperclip' not installed.", parent=popup)
 
-            # Create Buttons (packed inside button_frame)
-            copy_button = ttk.Button(
-                button_frame,
-                text="Copy",
-                command=_copy_to_clipboard,
-                state=(tk.NORMAL if pyperclip else tk.DISABLED) # Enable only if module loaded
-            )
-            copy_button.pack(side=tk.LEFT, padx=(0, 5)) # Place left, add space to right
-
+            copy_button = ttk.Button(button_frame, text="Copy", command=_copy_to_clipboard, state=(tk.NORMAL if pyperclip else tk.DISABLED))
+            copy_button.pack(side=tk.LEFT, padx=(0, 5))
             close_button = ttk.Button(button_frame, text="Close", command=popup.destroy)
-            close_button.pack(side=tk.LEFT) # Place next to copy button
+            close_button.pack(side=tk.LEFT)
 
-            # Center the popup relative to the main window (optional but nice)
-            popup.update_idletasks() # Ensure window size is calculated before getting geometry
-            root_x, root_y = self.root.winfo_x(), self.root.winfo_y()
-            root_w, root_h = self.root.winfo_width(), self.root.winfo_height()
+            # Center popup
+            popup.update_idletasks()
+            root_x, root_y = self.root.winfo_x(), self.root.winfo_y(); root_w, root_h = self.root.winfo_width(), self.root.winfo_height()
             popup_w, popup_h = popup.winfo_width(), popup.winfo_height()
-            x = root_x + (root_w // 2) - (popup_w // 2)
-            y = root_y + (root_h // 2) - (popup_h // 2)
-            popup.geometry(f'+{x}+{y}') # Set position
+            x = root_x + (root_w // 2) - (popup_w // 2); y = root_y + (root_h // 2) - (popup_h // 2)
+            popup.geometry(f'+{x}+{y}')
 
-            # Focus management
-            popup.focus_set() # Focus the popup window itself
-            text_widget.focus_set() # Focus the text widget for immediate selection/scrolling
+            popup.focus_set(); text_widget.focus_set() # Focus text
+            self.root.wait_window(popup) # Wait until closed
 
-            # Wait for the window to be closed (essential for grab_set/modal behavior)
-            self.root.wait_window(popup)
+        except tk.TclError as e: print(f"Failed text popup: {e}") # Window likely closed
+        except Exception as e: print(f"Unexpected popup err: {e}\n{traceback.format_exc()}")
 
-        except tk.TclError as e:
-             print(f"Failed to create selectable text popup (window closed?): {e}")
-             # Fallback to standard message box if Toplevel fails
-             self.show_success(title, "[Error displaying popup]\n\n" + text_content)
-        except Exception as e:
-            import traceback
-            print(f"Unexpected error creating selectable text popup: {e}\n{traceback.format_exc()}")
-            # Fallback
-            self.show_success(title, "[Error displaying popup]\n\n" + text_content)
-
-    def update_progress(self, current_bytes, total_bytes, speed_bps, eta_sec, context_msg=""):
-        """Updates the progress bar and status text, including optional context."""
-        # Ensure this runs in the main thread
+    def update_progress(self, current, total, speed, eta, context=""):
+        """Updates the progress bar and status text."""
         try:
-            # Check if progress bar exists
-            if not hasattr(self, 'progress_bar') or not self.progress_bar.winfo_exists():
-                return
-
-            if total_bytes > 0:
-                percentage = int((current_bytes / total_bytes) * 100)
-                safe_percentage = max(0, min(100, percentage)) # Clamp 0-100
-                self.progress_bar['value'] = safe_percentage
-
-                speed_str = self._format_speed(speed_bps)
-                eta_str = self._format_eta(eta_sec)
-                status_text = f"Progress: {safe_percentage}% ({speed_str}, ETA: {eta_str})"
-                if context_msg:
-                     status_text += f" - {context_msg}" # Append context (e.g., filename)
-                self.update_status(status_text)
-            else:
-                # Handle zero-byte transfers or initial state
+            if not hasattr(self, 'progress_bar') or not self.progress_bar.winfo_exists(): return
+            if total > 0:
+                p = int((current / total) * 100); sp = max(0, min(100, p))
+                self.progress_bar['value'] = sp
+                ss = self._format_speed(speed); es = self._format_eta(eta)
+                status = f"Progress: {sp}% ({ss}, ETA: {es})"
+                if context: status += f" - {context}"
+                self.update_status(status)
+            else: # Handle 0-byte or initial state
                 self.progress_bar['value'] = 0
-                status_text = "Progress: Calculating..."
-                if context_msg: status_text += f" - {context_msg}"
-                # Specifically handle 0-byte files/batches
-                if total_bytes == 0 and current_bytes == 0:
-                    status_text = "Progress: 0 bytes"
-                    if context_msg: status_text += f" - {context_msg}"
-                self.update_status(status_text)
-        except tk.TclError: pass # Ignore errors if window is closing
-        except Exception as e: print(f"Error updating progress: {e}")
+                status = "Progress: 0 bytes" if (total == 0 and current == 0) else "Progress: Calculating..."
+                if context: status += f" - {context}"
+                self.update_status(status)
+        except tk.TclError: pass
+        except Exception as e: print(f"Err update progress: {e}")
 
     def reset_progress(self):
-        """Resets the progress bar to 0."""
-
-        # --- Define helper function for root.after ---
-        def _do_reset_progress():
-            """Internal function to perform the reset safely."""
+        """Resets the progress bar to 0 via main thread using helper function."""
+        def _do_reset():
             try:
-                # Check widget existence before configuring
                 if hasattr(self, 'progress_bar') and self.progress_bar.winfo_exists():
                     self.progress_bar.config(value=0)
-            except tk.TclError:
-                pass # Ignore errors if window is closing
-            except Exception as e:
-                print(f"Error resetting progress bar: {e}")
-        # -------------------------------------------
+            except tk.TclError: pass # Ignore if UI closing
+            except Exception as e: print(f"Error resetting progress bar: {e}")
+        self.root.after(0, _do_reset) # Schedule helper in main loop
 
-        # Ensure this runs in the main thread by scheduling the helper function
-        self.root.after(0, _do_reset_progress)
-
-        # Optionally reset status bar message here too after a short delay
-        # self.root.after(100, lambda: self.update_status("Ready.") if not self.controller.is_transfer_active else None)
-        
     def add_history_log(self, log_message):
-        """Adds a timestamped message to the history text widget."""
-        # Ensure this runs in the main thread
+        """Adds a timestamped message to the history text widget via main thread."""
         def _update_history():
             try:
-                # Check if widget exists and window is valid
                 if hasattr(self, 'history_text') and self.history_text.winfo_exists():
-                    self.history_text.config(state=tk.NORMAL) # Enable writing
-                    timestamp = time.strftime("%H:%M:%S", time.localtime())
+                    self.history_text.config(state=tk.NORMAL) # Enable
+                    timestamp = time.strftime("%H:%M:%S")
                     self.history_text.insert(tk.END, f"{timestamp} - {log_message}\n")
-                    self.history_text.see(tk.END) # Scroll to the bottom
-                    self.history_text.config(state=tk.DISABLED) # Disable writing again
-            except tk.TclError: pass # Expected if window is closing
+                    self.history_text.see(tk.END) # Scroll down
+                    self.history_text.config(state=tk.DISABLED) # Disable again
+            except tk.TclError: pass # Ignore if UI closing
             except Exception as e: print(f"Unexpected error updating history log: {e}")
-        # Schedule update in main thread
+        # Schedule the update in the main Tkinter thread
         self.root.after(0, _update_history)
 
     def destroy_window(self):
         """Safely destroys the Tkinter root window."""
         print("UI: Received request to destroy window.")
         try:
-            # Check if root exists and is valid before destroying
             if self.root and self.root.winfo_exists():
                 self.root.destroy()
                 print("UI: Window destroyed.")
             else:
                 print("UI: Window already destroyed or invalid.")
-        except tk.TclError as e:
-            print(f"Error during window destruction (might be already destroyed): {e}")
-        except Exception as e:
-            print(f"Unexpected error destroying window: {e}")
+        except tk.TclError as e: print(f"Error during window destruction: {e}")
+        except Exception as e: print(f"Unexpected error destroying window: {e}")

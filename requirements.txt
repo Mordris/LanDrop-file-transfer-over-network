@@ -3,11 +3,11 @@
 # Core networking and discovery
 zeroconf>=0.47.0,<1.0
 
-# Optional: Clipboard functionality for received text snippets
-# Install if you want the 'Copy' button/auto-copy feature to work.
+# Optional: Clipboard functionality
 pyperclip>=1.8.2,<2.0
 
-# Optional: Required ONLY for automatically generating self-signed TLS certificates
-# if TLS is enabled in the config AND certificate files are missing.
-# Not needed if TLS is disabled or you provide your own certs.
+# Optional: Required ONLY for generating self-signed TLS certificates
 cryptography>=3.4
+
+# Required for handling PNG icons in Tkinter cross-platform
+Pillow>=9.0.0
