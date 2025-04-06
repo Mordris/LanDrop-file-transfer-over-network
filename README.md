@@ -1,6 +1,6 @@
 # LanDrop 💧
 
-![LanDrop Icon](landrop/assets/LanDrop.png) <!-- Optional: Add your logo here -->
+![LanDrop Icon](landrop/assets/LanDrop.png)
 
 **LanDrop** is a simple, cross-platform tool for transferring files, folders, and text snippets directly between devices on your local network. It uses Zeroconf (Bonjour/Avahi) for automatic device discovery, eliminating the need to manually enter IP addresses.
 
@@ -41,7 +41,7 @@
 2.  **Clone the Repository:**
 
     ```bash
-    git clone https://github.com/Mordris/LanDrop-file-transfer-over-network # Replace with your repo URL
+    git clone https://github.com/Mordris/LanDrop-file-transfer-over-network
     cd LanDrop
     ```
 
@@ -97,7 +97,7 @@
     - Files/folders are saved to the directory specified in `config.ini` (defaults to your user's Downloads folder). A unique sub-directory is created for multi-file/folder transfers.
     - Received text snippets appear in a pop-up window with a "Copy" button (if `pyperclip` is installed). Text might also be automatically copied to the clipboard based on the `copy_text_to_clipboard` setting.
 
-## Configuration
+## Configuration (Will be added soon)
 
 LanDrop uses a configuration file (`config.ini`) located in:
 
@@ -131,7 +131,5 @@ Available options:
 Contributions are welcome! Please feel free to open an issue or submit a pull request.
 
 ## License
-
-<!-- Choose a license, e.g., MIT -->
 
 This project is licensed under the MIT License - see the LICENSE file (you'll need to create one) for details.
