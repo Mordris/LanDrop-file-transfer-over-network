@@ -15,6 +15,7 @@ TRANSFER_TYPE_TEXT = "TEXT"
 TRANSFER_TYPE_MULTI_START = "MULTI_START" # For multi-file
 TRANSFER_TYPE_MULTI_FILE = "MULTI_FILE"   # For multi-file
 TRANSFER_TYPE_MULTI_END = "MULTI_END"     # For multi-file
+TRANSFER_TYPE_ACCEPT = "ACCEPT" # New: Receiver confirms readiness
 TRANSFER_TYPE_REJECT = "REJECT"           # For receiver rejection (optional)
 
 # TLS constants (Basic - for self-signed certs)

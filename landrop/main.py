@@ -1,6 +1,7 @@
 import tkinter as tk
 import sys
 import os
+import time
 
 # Attempt standard import first
 try:
