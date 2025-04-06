@@ -1,123 +1,188 @@
-import tkinter as tk # Now needed for TclError check
+import tkinter as tk
 import queue
 import threading
 import os
 import sys
 from pathlib import Path
-import time # For history timestamps
-import traceback # For detailed error logging
+import time
+import traceback
 
+# Attempt to import pyperclip for clipboard functionality
 try:
-    import pyperclip # For text copy
+    import pyperclip
 except ImportError:
     pyperclip = None
-    print("Warning: 'pyperclip' not installed. Cannot copy received text to clipboard.")
-    print("Install it using: pip install pyperclip")
+    # Warning printed during initialization if needed
+    # print("Warning: 'pyperclip' not installed. Text copy features disabled.")
 
-
-# Relative imports
+# Relative imports of project modules
 from ..network.discovery import NetworkDiscovery
-from ..network.transfer import FileSender, FileReceiver
-from ..utils.file_utils import generate_unique_filepath # Keep this specific utility
+from ..network.transfer import FileSender, FileReceiver, create_ssl_context # Import network classes and SSL helper
+from ..utils.file_utils import generate_unique_filepath # Import specific util
 from ..utils.config_manager import ConfigManager
-from ..utils.constants import (SERVICE_TYPE, APP_PORT, APP_NAME,
-                        TRANSFER_TYPE_FILE, TRANSFER_TYPE_TEXT)
+from ..utils.constants import (SERVICE_TYPE, APP_PORT, APP_NAME, CERT_DIR_NAME,
+                        CERT_FILE_NAME, KEY_FILE_NAME,
+                        TRANSFER_TYPE_FILE, TRANSFER_TYPE_TEXT,
+                        TRANSFER_TYPE_MULTI_START) # Import constants
+# For resolving IP addresses
+from zeroconf import IPVersion
 
 
 class AppLogic:
-    """Coordinates UI, network, transfers, history, config, and state."""
-    def __init__(self, root, config: ConfigManager): # Pass config manager
+    """
+    Coordinates UI (MainWindow), network discovery (NetworkDiscovery),
+    file transfers (FileSender, FileReceiver), history logging,
+    configuration management (ConfigManager), and application state.
+    """
+    def __init__(self, root: tk.Tk, config: ConfigManager):
+        """
+        Initializes the application logic.
+
+        Args:
+            root: The Tkinter root window instance.
+            config: The initialized ConfigManager instance.
+        """
         self.root = root
         self.config = config
-        self.main_window = None
+        self.main_window = None # Reference to MainWindow instance, set via set_main_window
 
-        # State
+        # --- State Variables ---
+        # Discovery State
         self.discovered_services = {} # {full_service_name: (info_obj, os_info)}
-        self.selected_filepath = None
-        self.selected_text = None # Store text from UI input
-        self.selected_device_display_name = None # Just the name part (e.g., 'MyPC')
-        self.selected_device_address = None # Store (ip, port) of selected target
-        self.is_transfer_active = False
-        self.current_transfer_cancel_event = None # Event for the active transfer
-        self.current_transfer_address = None # Address tuple of the active transfer peer
+        self.selected_device_display_name = None # User-friendly name of the target device
+        self.selected_device_address = None # Resolved (ip, port) tuple of the target
+
+        # Selection State (What to send)
+        self.selected_filepaths = [] # List of absolute paths for multi-file selection
+        self.selected_folderpath = None # Absolute path for folder selection
+        self.selected_text = None # Text snippet if it's the active selection
+
+        # Transfer State
+        self.is_transfer_active = False # Flag indicating if a send/receive is in progress
+        self.current_transfer_cancel_event = None # Event to signal cancellation to the active transfer thread
+        self.current_transfer_address = None # (ip, port) of the peer in the active transfer
+        self.current_transfer_is_multi = False # Flag if the active transfer is a multi-file batch
+
+        # Confirmation State (Managed here for thread safety via queues/events)
+        # Stores events that receiver threads wait on for UI confirmation
         self.pending_confirmations = {} # {addr_str: confirmation_event}
+        # Stores the boolean result from the UI confirmation dialog
         self.confirmation_results = {} # {addr_str: bool_result}
-        self.history_log = [] # Store tuples: (timestamp, type, status, details)
 
-        # Communication & Control
-        self.discovery_queue = queue.Queue()
-        self.transfer_queue = queue.Queue()
-        self.stop_event = threading.Event() # Global shutdown signal
+        # History Log
+        self.history_log = [] # List of tuples: (timestamp, type, status, details)
 
-        # Modules
+        # --- Communication & Control ---
+        self.discovery_queue = queue.Queue() # Messages from NetworkDiscovery thread
+        self.transfer_queue = queue.Queue() # Status messages from FileSender/FileReceiver threads
+        self.stop_event = threading.Event() # Global shutdown signal for all threads
+
+        # --- Modules Initialization ---
         self.network_discovery = NetworkDiscovery(self.discovery_queue, self.stop_event, self.config)
-        # Pass self reference to receiver for confirmation callback
+        # Pass self reference to receiver for callbacks (confirmation result retrieval)
         self.file_receiver = FileReceiver(self.config, self.transfer_queue, self.stop_event, self)
 
+        # Print warning if pyperclip is missing (only once)
+        if pyperclip is None:
+            print("Warning: 'pyperclip' module not installed. Text copy features will be disabled.")
+            print("         Install it using: pip install pyperclip")
+
+
     def set_main_window(self, window):
+        """
+        Stores a reference to the main UI window after it's created
+        and performs initial UI-dependent checks.
+
+        Args:
+            window: The MainWindow instance.
+        """
         self.main_window = window
-        # Check downloads dir validity on startup based on config
+        # Check downloads directory validity now that the UI exists for error reporting
+        self._check_downloads_directory()
+
+    def _check_downloads_directory(self):
+        """Checks if the configured downloads directory is valid."""
         downloads_dir = self.config.get_setting('Preferences', 'downloads_directory')
+        if not downloads_dir:
+            print("Error: Downloads directory not found in configuration.")
+            return # Cannot proceed without a setting
+
         try:
-            # Attempt to create if it doesn't exist? Risky. Better to just check.
-            if not Path(downloads_dir).is_dir():
-                # Try to get default path again as fallback display
+            download_path = Path(downloads_dir)
+            # Check if it exists and is a directory
+            if not download_path.is_dir():
                 fallback_path = self.config._defaults['Preferences']['downloads_directory']
-                error_msg = (f"Configured downloads directory '{downloads_dir}' is invalid or inaccessible.\n"
-                             f"Please check config file or ensure folder exists.\n"
-                             f"Using fallback path for checks: {fallback_path}\n"
-                             "(File reception may fail if path is unwritable)")
-                # Use root.after to ensure messagebox runs in main thread after window is ready
-                self.root.after(100, lambda: self.main_window.show_error("Configuration Error", error_msg))
+                error_msg = (f"Configured downloads directory:\n'{downloads_dir}'\n"
+                             f"is invalid or inaccessible.\n\n"
+                             f"Using fallback path:\n{fallback_path}\n\n"
+                             "(File reception may fail if this path is also invalid or unwritable)")
+                # Schedule error display in main thread
+                if self.main_window:
+                    self.root.after(100, lambda: self.main_window.show_error("Configuration Error", error_msg))
+                else:
+                    print(f"ERROR: {error_msg}") # Print if UI not ready
         except Exception as e:
-             # Catch errors during path check itself
+             # Catch errors during the path check itself (e.g., permissions)
              error_msg = f"Error checking downloads directory '{downloads_dir}': {e}"
-             self.root.after(100, lambda: self.main_window.show_error("Configuration Error", error_msg))
+             if self.main_window:
+                  self.root.after(100, lambda: self.main_window.show_error("Configuration Error", error_msg))
+             else:
+                  print(f"ERROR: {error_msg}")
 
 
     def start(self):
-        """Starts background processes and the update queue polling."""
-        print("AppLogic: Starting...")
+        """Starts background processes (discovery, receiver) and the queue polling loop."""
+        print("AppLogic: Starting background services...")
         self.network_discovery.start()
-        self.file_receiver.start() # Receiver now checks downloads dir internally if needed
+        self.file_receiver.start()
+        # Start polling queues for updates from background threads
         self._poll_queues()
-        self._update_button_states() # Initial button state update
+        # Set initial button states based on default state
+        self._update_button_states()
 
 
     def _poll_queues(self):
-        """Periodically checks discovery and transfer queues for messages."""
+        """
+        Periodically checks discovery and transfer queues for messages
+        from background threads and updates state/UI accordingly.
+        This runs continuously via `root.after`.
+        """
         # --- Process Discovery Queue ---
         try:
             while not self.discovery_queue.empty():
                 message = self.discovery_queue.get_nowait()
                 action = message[0]
-
-                if not self.main_window: continue # Skip if UI gone
+                # Ensure UI window still exists before trying to update it
+                if not self.main_window or not self.root.winfo_exists(): continue
 
                 if action == "status":
-                    if not self.is_transfer_active: # Avoid overwriting transfer status
+                    # Update status bar only if no transfer is active (avoid overwriting progress)
+                    if not self.is_transfer_active:
                         status_msg = message[1]
                         self.root.after(0, lambda m=status_msg: self.main_window.update_status(m))
                 elif action == "add":
-                    # message = ("add", full_service_name, info_obj, os_info)
+                    # ('add', full_service_name, zeroconf_info_obj, os_info_str)
                     full_service_name, info, os_info = message[1:]
-                    # Avoid adding self (check full advertised name)
+                    # Avoid adding self by comparing advertised name
                     if full_service_name != self.network_discovery.get_advertised_name():
                         self.discovered_services[full_service_name] = (info, os_info)
+                        # Extract display name (part before ._landrop._tcp.local.)
                         display_name = full_service_name.split(f'.{SERVICE_TYPE}')[0]
+                        # Schedule UI update in main thread
                         self.root.after(0, lambda d=display_name, o=os_info: self.main_window.update_device_list("add", d, o))
                 elif action == "remove":
-                    # message = ("remove", full_service_name)
+                    # ('remove', full_service_name)
                     full_service_name = message[1]
                     if full_service_name in self.discovered_services:
                         display_name = full_service_name.split(f'.{SERVICE_TYPE}')[0]
                         del self.discovered_services[full_service_name]
+                        # Schedule UI update
                         self.root.after(0, lambda d=display_name: self.main_window.update_device_list("remove", d))
-                        # If removed device was selected, clear selection
+                        # If the removed device was the selected one, clear the selection
                         if self.selected_device_display_name == display_name:
-                            self.handle_device_selection(None) # Clear selection via handler
+                            self.handle_device_selection(None) # Clear selection state
 
-        except queue.Empty: pass
+        except queue.Empty: pass # No discovery messages, normal
         except Exception as e: print(f"Error processing discovery queue: {e}\n{traceback.format_exc()}")
 
         # --- Process Transfer Queue ---
@@ -125,376 +190,450 @@ class AppLogic:
              while not self.transfer_queue.empty():
                 message = self.transfer_queue.get_nowait()
                 action = message[0]
+                if not self.main_window or not self.root.winfo_exists(): continue
 
-                if not self.main_window: continue # Skip if UI gone
-
-                # --- Handle Specific Actions ---
+                # --- Handle Specific Actions from Transfer Agents ---
                 if action == "status":
-                    # msg = ('status', message)
-                    status_msg = message[1]
-                    self.root.after(0, lambda m=status_msg: self.main_window.update_status(m))
+                    # ('status', message_string)
+                    self.root.after(0, lambda m=message[1]: self.main_window.update_status(m))
 
                 elif action == "progress":
-                    # msg = ('progress', 'send'/'receive', current, total, speed, eta)
-                    self.is_transfer_active = True # Ensure flag is set
-                    _op, current, total, speed, eta = message[1:]
-                    self.root.after(0, lambda c=current, t=total, s=speed, e=eta: self.main_window.update_progress(c, t, s, e))
-                    # Button states managed by _update_button_states called periodically or on state change
-                    self._update_button_states() # Update now to ensure cancel is enabled
+                    # ('progress', 'send'/'receive', current_bytes, total_bytes, speed_bps, eta_sec, context_msg)
+                    self.is_transfer_active = True # Ensure flag is set during progress
+                    _op, current, total, speed, eta, context = message[1:]
+                    self.root.after(0, lambda c=current, t=total, s=speed, e=eta, ctx=context: self.main_window.update_progress(c, t, s, e, ctx))
+                    # No need to call _update_button_states here; transfer active state handles it
 
                 elif action == "complete":
-                    # msg = ('complete', 'send'/'receive', success_msg)
+                    # ('complete', 'send'/'receive', success_message)
                     op_type, success_msg = message[1:]
                     title = "Transfer Complete"
-                    # Use standard success box for file, custom logic handles text popup trigger
-                    if op_type == "send" or "File" in success_msg: # Check if it's file-related
+                    # Show success popup only for file/batch transfers, not text
+                    is_text_related = "text snippet" in success_msg.lower()
+                    if not is_text_related:
                         self.root.after(0, lambda t=title, m=success_msg: self.main_window.show_success(t, m))
 
                     self.root.after(0, lambda m=success_msg: self.main_window.update_status(f"Complete: {m}"))
-                    self.root.after(0, self.main_window.reset_progress)
+                    self.root.after(0, self.main_window.reset_progress) # Reset progress bar
                     self._add_history(op_type, "Success", success_msg)
-                    self._reset_transfer_state() # Sets is_transfer_active=False and updates buttons
+                    self._reset_transfer_state() # Reset flags and update buttons
 
                 elif action == "error":
-                    # msg = ('error', 'send'/'receive'/'server'/'cancel', error_msg)
+                    # ('error', 'send'/'receive'/'server'/'cancel', error_message)
                     op_type, error_msg = message[1], message[2]
                     title = f"{op_type.capitalize()} Error"
                     self.root.after(0, lambda t=title, m=error_msg: self.main_window.show_error(t, m))
                     self.root.after(0, lambda m=error_msg: self.main_window.update_status(f"Error: {m}"))
                     self.root.after(0, self.main_window.reset_progress)
-                    # Use specific status if it was a cancellation
                     status = "Cancelled" if op_type == "cancel" else "Failed"
                     self._add_history(op_type, status, error_msg)
-                    self._reset_transfer_state()
+                    self._reset_transfer_state() # Reset flags and update buttons
 
                 elif action == "confirm_receive":
-                     # msg = ('confirm_receive', filename, size, addr_str, confirmation_event)
-                     filename, size, addr_str, confirmation_event = message[1:]
-                     # Check if already confirming for this address to prevent duplicates
+                     # ('confirm_receive', item_name, size_bytes, addr_str, confirmation_event, is_multi, item_count)
+                     item_name, size, addr_str, confirmation_event = message[1:5]
+                     is_multi = message[5] if len(message) > 5 else False
+                     item_count = message[6] if len(message) > 6 else 1
+
                      if addr_str not in self.pending_confirmations:
                          self.pending_confirmations[addr_str] = confirmation_event
-                         # Ask user in main thread
-                         self.root.after(0, lambda f=filename, s=size, a=addr_str: self._ask_user_confirmation(f, s, a))
-                     else:
-                          print(f"Ignoring duplicate confirmation request for {addr_str}")
+                         # Schedule the UI dialog in the main thread
+                         self.root.after(0, lambda name=item_name, s=size, a=addr_str, multi=is_multi, count=item_count:
+                                         self._ask_user_confirmation(name, s, a, multi, count))
+                     else: print(f"Ignoring duplicate confirmation request for {addr_str}")
 
                 elif action == "text_received":
-                     # msg = ('text_received', text_content, source_addr_str)
+                     # ('text_received', text_content, source_addr_str)
                      text_content, source_addr_str = message[1:]
-                     # Handle display/copy in main thread
                      self.root.after(0, lambda txt=text_content, src=source_addr_str: self._handle_received_text(txt, src))
-                     # Completion/history is handled by the 'complete' message that follows text reception
 
-                elif action == "info": # General info messages for status bar/history
+                elif action == "info":
+                     # ('info', info_message) - General info for status or history
                      info_msg = message[1]
                      self.root.after(0, lambda m=info_msg: self.main_window.update_status(f"Info: {m}"))
                      self._add_history("info", "Info", info_msg)
 
-        except queue.Empty: pass
-        except IndexError: print(f"Warning: Malformed message in transfer queue: {message}")
+        except queue.Empty: pass # Normal case
+        except IndexError as e: print(f"Warning: Malformed message in transfer queue: {message} - {e}")
         except Exception as e: print(f"Error processing transfer queue: {e}\n{traceback.format_exc()}")
 
         finally:
-            # Only reschedule if the stop event isn't set
+            # Reschedule polling if application is not shutting down
             if not self.stop_event.is_set():
-                 self.root.after(150, self._poll_queues) # Reschedule polling
+                 self.root.after(150, self._poll_queues) # Poll every 150ms
 
     def _update_button_states(self):
-        """Central method to update UI button states based on app state."""
-        # Send button enabled if: not active transfer AND device selected AND (file selected OR text entered)
-        has_file = bool(self.selected_filepath)
-        # Ensure text state is current
-        if self.main_window and hasattr(self.main_window, 'text_input'):
-             try:
-                 current_text = self.main_window.text_input.get("1.0", tk.END).strip()
-                 self.selected_text = current_text if current_text else None
-             except Exception: # Catch potential errors if widget state is weird
-                 self.selected_text = None
-        else:
-             self.selected_text = None # Ensure it's None if UI not ready
+        """Central method to update UI button states based on current app state."""
+        try:
+            # Determine if there's something selected to send
+            has_files = bool(self.selected_filepaths)
+            has_folder = bool(self.selected_folderpath)
+            has_text = False # Check text only if files/folder are NOT selected
 
-        has_text = bool(self.selected_text)
-        can_send = bool(self.selected_device_display_name and (has_file or has_text))
+            if not has_files and not has_folder:
+                if self.main_window and hasattr(self.main_window, 'text_input'):
+                    current_text = self.main_window.text_input.get("1.0", tk.END).strip()
+                    has_text = bool(current_text)
+                    # Update internal state only if text is the active selection
+                    self.selected_text = current_text if has_text else None
+                else: self.selected_text = None # Clear if UI not ready
+            else: self.selected_text = None # Clear text state if files/folder active
 
-        send_enabled = can_send and not self.is_transfer_active
-        cancel_enabled = self.is_transfer_active
+            can_select_item = has_files or has_folder or has_text
+            can_select_target = bool(self.selected_device_display_name)
+            can_send = can_select_item and can_select_target
 
-        if self.main_window:
-             # Schedule UI update in main thread
-             self.root.after(0, lambda se=send_enabled, ce=cancel_enabled: self.main_window.update_button_states(se, ce))
+            # Determine button enable/disable states
+            send_enabled = can_send and not self.is_transfer_active
+            cancel_enabled = self.is_transfer_active
+
+            # Schedule UI update in main thread if window exists
+            if self.main_window and self.root.winfo_exists():
+                 self.root.after(0, lambda se=send_enabled, ce=cancel_enabled: self.main_window.update_button_states(se, ce))
+        except tk.TclError: pass # Ignore errors if UI is being destroyed
+        except Exception as e: print(f"Error updating button states: {e}")
 
     def check_send_button_state_external(self):
-        """Allows UI to trigger a button state check, e.g., on text change."""
-        # Update internal text state first (already handled in _update_button_states, just trigger it)
+        """Allows UI to trigger a button state check externally (e.g., on text change)."""
         self._update_button_states()
 
     def _reset_transfer_state(self):
-         """Clears flags and events after a transfer finishes, fails or is cancelled."""
+         """Clears transfer-related flags and updates UI buttons."""
+         print("AppLogic: Resetting transfer state.")
          self.is_transfer_active = False
          self.current_transfer_cancel_event = None
          self.current_transfer_address = None
-         self._update_button_states() # Update buttons now transfer is done
+         self.current_transfer_is_multi = False
+         # Update buttons immediately after resetting state
+         self._update_button_states()
 
     def _add_history(self, type, status, details):
-        """Adds an entry to the history log and updates UI."""
+        """Adds an entry to the history log and schedules UI update."""
         timestamp = time.time()
         log_entry = (timestamp, type, status, details)
         self.history_log.append(log_entry)
         # Limit history size? e.g., self.history_log = self.history_log[-100:]
-        if self.main_window:
-             # Format for display
+        if self.main_window and self.root.winfo_exists():
              details_short = (str(details)[:75] + '...') if len(str(details)) > 75 else str(details)
-             log_str = f"[{type[:4].upper()}] {status}: {details_short}" # Shorten type if needed
+             type_short = type[:4].upper() if len(type) > 4 else type.upper()
+             log_str = f"[{type_short}] {status}: {details_short}"
+             # MainWindow's method already uses root.after
              self.main_window.add_history_log(log_str)
 
-    def _ask_user_confirmation(self, filename, size_bytes, addr_str):
-        """Show confirmation dialog (runs in main thread via root.after)."""
-        if not self.main_window:
-             print(f"Cannot ask confirmation for {addr_str}, main window is gone.")
-             # Automatically reject if UI is gone?
-             self.confirmation_results[addr_str] = False
+    def _ask_user_confirmation(self, item_name, size_bytes, addr_str, is_multi=False, item_count=1):
+        """Displays confirmation dialog (must run in main thread)."""
+        if not self.main_window or not self.root.winfo_exists():
+             print(f"Cannot ask confirmation for {addr_str}, main window gone.")
+             self.confirmation_results[addr_str] = False # Auto-reject
              if addr_str in self.pending_confirmations:
-                 self.pending_confirmations[addr_str].set()
+                 try: self.pending_confirmations[addr_str].set()
+                 except Exception: pass
                  del self.pending_confirmations[addr_str]
              return
 
+        result = False # Default to reject
         try:
-            size_str = f"{size_bytes / (1024*1024):.2f} MB" if size_bytes >= 1024*1024 else f"{size_bytes / 1024:.1f} KB"
-            if size_bytes < 1024: size_str = f"{size_bytes} B"
+            size_str = self.main_window._format_size(size_bytes) if hasattr(self.main_window, '_format_size') else f"{size_bytes} B"
+            title = "Incoming Batch Transfer" if is_multi else "Incoming File Transfer"
+            message = (f"Accept {item_count} items ({size_str})\nin batch '{item_name}' from {addr_str}?"
+                       if is_multi else
+                       f"Accept file '{item_name}' ({size_str})\nfrom {addr_str}?")
 
-            title = "Incoming File Transfer"
-            message = f"Accept file '{filename}' ({size_str})\nfrom {addr_str}?"
-
-            result = self.main_window.ask_confirmation(title, message) # Executes in main thread
+            # This executes in main thread because it was scheduled via root.after
+            result = self.main_window.ask_confirmation(title, message)
             print(f"User confirmation result for {addr_str}: {result}")
 
-            # Store result and signal waiting receiver thread
-            self.confirmation_results[addr_str] = result
-            if addr_str in self.pending_confirmations:
-                self.pending_confirmations[addr_str].set() # Wake up receiver thread
-                del self.pending_confirmations[addr_str] # Clean up
-            else:
-                 print(f"Warning: Confirmation event not found for {addr_str} after dialog.")
         except Exception as e:
              print(f"Error during user confirmation dialog for {addr_str}: {e}")
-             # Default to reject on error
-             self.confirmation_results[addr_str] = False
-             if addr_str in self.pending_confirmations:
-                 self.pending_confirmations[addr_str].set()
-                 del self.pending_confirmations[addr_str]
+             result = False # Ensure rejection on error
+        finally:
+            # Store result and signal waiting receiver thread regardless of dialog success/failure
+            self.confirmation_results[addr_str] = result
+            if addr_str in self.pending_confirmations:
+                try:
+                    self.pending_confirmations[addr_str].set() # Signal waiter
+                except Exception as set_e:
+                    print(f"Error setting confirmation event for {addr_str}: {set_e}")
+                # Remove from pending list *after* setting the event
+                del self.pending_confirmations[addr_str]
+            else:
+                 # Event might be gone if receiver timed out/errored before dialog finished
+                 print(f"Warning: Confirmation event no longer pending for {addr_str} after dialog.")
+                 # Clean up result dict if event gone
+                 if addr_str in self.confirmation_results: del self.confirmation_results[addr_str]
 
     def get_confirmation_result(self, addr_str) -> bool:
-         """Called by receiver thread (via self reference) to get stored result."""
-         result = self.confirmation_results.get(addr_str, False) # Default to False (reject)
-         # Clean up result after retrieval
-         if addr_str in self.confirmation_results:
-             del self.confirmation_results[addr_str]
-         return result
+         """Called by receiver thread to retrieve the stored confirmation result."""
+         # Receiver's finally block should clean up the result dict entry
+         return self.confirmation_results.get(addr_str, False)
 
     def _handle_received_text(self, text_content, source_addr_str):
-         """Handle received text snippet using custom popup."""
+         """Displays received text popup and handles clipboard copy."""
          print(f"Handling received text from {source_addr_str}")
-
-         # Use the custom method for displaying text
          title = f"Text Snippet from {source_addr_str}"
-         # Schedule the popup display in the main thread
-         # Ensure main window exists before scheduling
-         if self.main_window:
-              self.root.after(0, lambda t=title, c=text_content: self.main_window.show_selectable_text_popup(t, c))
-         else:
-              print("Cannot display received text, main window is not available.")
 
-         # Copy to clipboard (if available and enabled)
+         # Schedule UI popup in main thread
+         if self.main_window and self.root.winfo_exists():
+              self.root.after(0, lambda t=title, c=text_content: self.main_window.show_selectable_text_popup(t, c))
+         else: print("Cannot display received text, main window is not available.")
+
+         # Copy to clipboard if enabled
          if pyperclip and self.config.get_boolean_setting('Preferences', 'copy_text_to_clipboard'):
              try:
                  pyperclip.copy(text_content)
                  print("Copied received text to clipboard.")
-                 if self.main_window: # Update status only if window exists
+                 if self.main_window and self.root.winfo_exists():
                       self.root.after(100, lambda: self.main_window.update_status("Text copied to clipboard."))
              except Exception as e:
                   print(f"Failed to copy text to clipboard: {e}")
-                  if self.main_window:
+                  if self.main_window and self.root.winfo_exists():
                        self.root.after(0, lambda: self.main_window.show_error("Clipboard Error", f"Could not copy text: {e}"))
 
 
     # --- Event Handlers (Called by MainWindow) ---
 
-    def handle_file_selection(self, filepath):
-        """Processes file selection from the UI."""
-        self.selected_filepath = filepath
-        # Update internal text state when file selected (clear text)
-        self.selected_text = None
-        if filepath:
-            filename = os.path.basename(filepath)
-            if self.main_window and not self.is_transfer_active:
-                 self.root.after(0, lambda f=filename: self.main_window.update_status(f"Selected File: {f}"))
-        else:
-             if self.main_window and not self.is_transfer_active:
-                 self.root.after(0, lambda: self.main_window.update_status("File selection cancelled."))
-        # Clear UI text input if file is selected
-        if self.main_window and hasattr(self.main_window, 'text_input'):
-             self.root.after(0, lambda: self.main_window.text_input.delete('1.0', tk.END))
+    def handle_files_selection(self, filepaths: list | tuple | None):
+        """Processes multiple file selections from UI. Clears other selections."""
+        new_selection = list(filepaths) if filepaths else []
+        if new_selection != self.selected_filepaths:
+            self.selected_filepaths = new_selection
+            self.selected_folderpath = None # Clear folder
+            self.selected_text = None # Clear text state
+            print(f"AppLogic: Files selected: {len(self.selected_filepaths)}")
+            # UI display update is handled by MainWindow callback (_select_files_ui)
+            # Clear UI text input if files selected
+            if self.main_window and hasattr(self.main_window, 'text_input'):
+                self.root.after(0, lambda: self.main_window.text_input.delete('1.0', tk.END))
+            self._update_button_states() # Update buttons based on new state
 
-        self._update_button_states()
-
+    def handle_folder_selection(self, folderpath: str | None):
+        """Processes folder selection from UI. Clears other selections."""
+        if folderpath != self.selected_folderpath:
+            self.selected_folderpath = folderpath
+            self.selected_filepaths = [] # Clear files
+            self.selected_text = None # Clear text state
+            print(f"AppLogic: Folder selected: {self.selected_folderpath}")
+            # UI display update is handled by MainWindow callback (_select_folder_ui)
+            # Clear UI text input if folder selected
+            if self.main_window and hasattr(self.main_window, 'text_input'):
+                self.root.after(0, lambda: self.main_window.text_input.delete('1.0', tk.END))
+            self._update_button_states() # Update buttons based on new state
 
     def handle_device_selection(self, display_name):
-        """Processes device selection from the UI (expects name without OS tag)."""
-        self.selected_device_display_name = display_name
-        self.selected_device_address = None # Clear address until needed
-        # Find the corresponding service info to potentially store address early (optional)
-        if display_name:
-             full_service_name = f"{display_name}.{SERVICE_TYPE}"
-             service_data = self.discovered_services.get(full_service_name)
-             if service_data:
-                  info, _os = service_data
-                  try:
-                       if info.parsed_addresses():
-                            ip = info.parsed_addresses()[0]
-                            port = info.port
-                            self.selected_device_address = (ip, port) # Store for potential later use
-                  except (IndexError, AttributeError) as e:
-                       print(f"Could not get address for selected device {display_name}: {e}")
-
-        self._update_button_states()
+        """Processes device selection from the UI listbox."""
+        if display_name != self.selected_device_display_name:
+            self.selected_device_display_name = display_name
+            self.selected_device_address = None # Reset address
+            print(f"AppLogic: Device selected: {display_name}")
+            # Try to resolve address immediately
+            if display_name:
+                 full_service_name = f"{display_name}.{SERVICE_TYPE}"
+                 service_data = self.discovered_services.get(full_service_name)
+                 if service_data:
+                      info, _ = service_data
+                      try:
+                           addrs = info.parsed_addresses(IPVersion.V4Only) # Prefer IPv4
+                           if addrs: self.selected_device_address = (addrs[0], info.port); print(f"   Resolved address: {self.selected_device_address}")
+                           else: print("   Warning: No IPv4 addresses found for selected device.")
+                      except Exception as e: print(f"   Warning: Could not get address for {display_name}: {e}")
+                 else: print("   Warning: Service info not found for selected device name.")
+            self._update_button_states() # Update buttons as target changed
 
     def handle_send_request(self, item_to_send, item_type):
-        """Handles the user clicking the 'Send' button."""
+        """Handles the 'Send' button click: validates, prepares, starts sender thread."""
+        # 1. Check state validity
         if self.is_transfer_active:
-             if self.main_window: self.main_window.show_error("Busy", "Another transfer is already in progress.")
+             if self.main_window: self.main_window.show_error("Busy", "Another transfer is in progress.")
              return
         if not item_to_send:
-             if self.main_window: self.main_window.show_error("Send Error", "No file or text specified.")
+             if self.main_window: self.main_window.show_error("Send Error", "Nothing selected to send.")
              return
         if not self.selected_device_display_name:
-            if self.main_window: self.main_window.show_error("Send Error", "Please select a target device.")
+            if self.main_window: self.main_window.show_error("Send Error", "No target device selected.")
             return
 
-        # Find target info again to ensure it's current
+        # 2. Get Target Address (re-resolve for freshness)
+        ip_address, port = None, None
         target_service_name = f"{self.selected_device_display_name}.{SERVICE_TYPE}"
         service_data = self.discovered_services.get(target_service_name)
-
-        if not service_data:
-            msg = f"Device '{self.selected_device_display_name}' may no longer be available."
-            if self.main_window: self.main_window.show_error("Send Error", msg)
+        if service_data:
+            info, _ = service_data
+            try:
+                addrs = info.parsed_addresses(IPVersion.V4Only)
+                if not addrs: raise ValueError("No IPv4 addresses.")
+                ip_address, port = addrs[0], info.port
+                self.selected_device_address = (ip_address, port) # Update stored address
+            except Exception as e:
+                 if self.main_window: self.main_window.show_error("Send Error", f"Could not resolve address for '{self.selected_device_display_name}': {e}")
+                 return
+        else:
+            if self.main_window: self.main_window.show_error("Send Error", f"Device '{self.selected_device_display_name}' no longer available.")
             self.root.after(0, lambda d=self.selected_device_display_name: self.main_window.update_device_list("remove", d))
-            self.handle_device_selection(None) # Clear selection state
+            self.handle_device_selection(None)
             return
 
-        info, _os = service_data
+        # 3. Prepare Transfer State
+        self.current_transfer_cancel_event = threading.Event()
+        self.is_transfer_active = True
+        self.current_transfer_address = (ip_address, port)
+        self.current_transfer_is_multi = (item_type == TRANSFER_TYPE_MULTI_START)
+        self._update_button_states() # Disable Send, Enable Cancel
+
+        # 4. Prepare TLS Context
+        use_tls = self.config.get_boolean_setting('Network', 'enable_tls')
+        ssl_context = None
+        if use_tls:
+             try:
+                  cert_dir = Path(self.config.config_path.parent) / CERT_DIR_NAME
+                  cert_file = cert_dir / CERT_FILE_NAME; key_file = cert_dir / KEY_FILE_NAME
+                  ssl_context = create_ssl_context(cert_dir, key_file, cert_file, server_side=False)
+                  if not ssl_context: use_tls = False; print("Warning: Failed client SSL context. Sending unencrypted.")
+             except Exception as e: use_tls = False; print(f"Error preparing client TLS: {e}. Sending unencrypted.")
+
+        # 5. Prepare and Start Sender Thread
+        send_thread = None
         try:
-            if not info.parsed_addresses(): raise ValueError("No parsed addresses.")
-            ip_address = info.parsed_addresses()[0]
-            port = info.port
-            self.selected_device_address = (ip_address, port) # Store current target
+            sender_args = {
+                'host': ip_address, 'port': port, 'status_queue': self.transfer_queue,
+                'cancel_event': self.current_transfer_cancel_event,
+                'use_tls': use_tls, 'ssl_context': ssl_context, 'item_type': item_type
+            }
 
-            print(f"Logic: Preparing to send {item_type} to {self.selected_device_display_name} at {ip_address}:{port}")
-            if self.main_window: self.root.after(0, lambda: self.main_window.update_status(f"Initiating send ({item_type})..."))
+            if item_type == TRANSFER_TYPE_TEXT:
+                print(f"Logic: Preparing TEXT send to {ip_address}:{port}")
+                sender_args['item'] = item_to_send
+                if self.main_window: self.root.after(0, lambda: self.main_window.update_status("Initiating text send..."))
+            elif item_type == TRANSFER_TYPE_FILE:
+                print(f"Logic: Preparing SINGLE FILE send to {ip_address}:{port}")
+                sender_args['item'] = item_to_send
+                if self.main_window: self.root.after(0, lambda item=item_to_send: self.main_window.update_status(f"Initiating send for {os.path.basename(item)}..."))
+            elif item_type == TRANSFER_TYPE_MULTI_START:
+                print(f"Logic: Preparing MULTI item send to {ip_address}:{port}")
+                file_list_info = self._prepare_multi_file_list(item_to_send)
+                if not file_list_info: raise ValueError("Failed to prepare file list.")
+                sender_args.update({
+                    'file_list': file_list_info['files'], 'total_items': file_list_info['count'],
+                    'total_size': file_list_info['size'], 'base_name': file_list_info['base_name']
+                })
+                if self.main_window: self.root.after(0, lambda c=file_list_info['count']: self.main_window.update_status(f"Initiating batch send ({c} items)..."))
+            else: raise ValueError(f"Internal Error: Unsupported item_type: {item_type}")
 
-            # Create cancellation event for this transfer
-            self.current_transfer_cancel_event = threading.Event()
-            self.is_transfer_active = True
-            self.current_transfer_address = (ip_address, port) # Store target address for cancellation purposes
-            self._update_button_states() # Disable send, enable cancel
-
-            # Get TLS settings from config
-            use_tls = self.config.get_boolean_setting('Network', 'enable_tls')
-            # Client needs context configured for client usage
-            ssl_context = None
-            if use_tls:
-                 # Assuming FileReceiver initialized its context if needed
-                 # Create a client-specific context
-                 try:
-                      # Need cert dir path from config manager or receiver
-                      cert_dir = Path(self.config.config_path.parent) / "certs" # Assuming relative to config
-                      cert_file = cert_dir / "landrop_cert.pem"
-                      key_file = cert_dir / "landrop_key.pem"
-                      # Import moved inside try block to avoid top-level import if unused
-                      from ..network.transfer import create_ssl_context
-                      ssl_context = create_ssl_context(cert_dir, key_file, cert_file, server_side=False)
-                      if not ssl_context:
-                           print("Warning: Failed to create client SSL context. Sending without TLS.")
-                           use_tls = False # Fallback to no TLS if context fails
-                 except ImportError:
-                      print("Warning: Could not import create_ssl_context. Sending without TLS.")
-                      use_tls = False
-                 except Exception as e:
-                      print(f"Error preparing client TLS context: {e}. Sending without TLS.")
-                      use_tls = False
-
-
-            sender = FileSender(
-                host=ip_address,
-                port=port,
-                item=item_to_send,
-                item_type=item_type,
-                status_queue=self.transfer_queue,
-                cancel_event=self.current_transfer_cancel_event,
-                use_tls=use_tls,
-                ssl_context=ssl_context # Pass configured context
-            )
-            send_thread = threading.Thread(target=sender.send, daemon=True)
+            # Start thread
+            sender = FileSender(**sender_args)
+            send_thread = threading.Thread(target=sender.send, name="SenderThread", daemon=True)
             send_thread.start()
+            print(f"Sender thread started for {item_type} to {ip_address}:{port}")
 
-        except (IndexError, ValueError, AttributeError) as e:
-             error_msg = f"Could not get valid connection details for '{self.selected_device_display_name}'. Error: {e}"
+        # Handle errors *during preparation* only (before thread starts)
+        except (ValueError, OSError, Exception) as e:
+             error_msg = f"Error preparing send: {e}"
+             print(f"ERROR: {error_msg}" + (f"\n{traceback.format_exc()}" if not isinstance(e, ValueError) else ""))
              if self.main_window: self.main_window.show_error("Send Error", error_msg)
-             self._reset_transfer_state() # Reset state on error
-        except Exception as e:
-             error_msg = f"An unexpected error occurred preparing the send: {e}"
-             if self.main_window: self.main_window.show_error("Send Error", f"{error_msg}\n{traceback.format_exc()}")
+             # Reset state because the thread never started
              self._reset_transfer_state()
+
+        # State reset for errors *during* transfer happens via queue processing
+
+    def _prepare_multi_file_list(self, selection) -> dict | None:
+        """Walks folder or processes file list to get details for MULTI transfer."""
+        files_to_send = [] # List of (absolute_path_str, relative_path_str)
+        total_size = 0
+        base_name = "Multiple Files" # Default base name
+
+        try:
+            if isinstance(selection, str) and os.path.isdir(selection): # Folder path
+                folder_path = Path(selection).resolve()
+                base_name = folder_path.name
+                print(f"Preparing folder: {folder_path}")
+                if not os.access(str(folder_path), os.R_OK): raise OSError(f"Permission denied: {folder_path}")
+
+                for root, dirs, files in os.walk(folder_path, topdown=True):
+                    # Modify dirs in-place to skip hidden directories
+                    dirs[:] = [d for d in dirs if not d.startswith('.')]
+                    current_root = Path(root)
+                    relative_dir = current_root.relative_to(folder_path)
+
+                    for file in files:
+                        if file.startswith('.'): continue # Skip hidden files
+                        abs_path = current_root / file
+                        try:
+                            if abs_path.is_file() and os.access(str(abs_path), os.R_OK):
+                                file_size = abs_path.stat().st_size
+                                relative_path = relative_dir / file # Keep original structure
+                                files_to_send.append((str(abs_path), str(relative_path.as_posix())))
+                                total_size += file_size
+                            # else: print(f"Debug: Skipping non-file/unreadable: {abs_path}")
+                        except OSError as e: print(f"Warning: Cannot access/stat {abs_path}, skipping: {e}")
+                        except Exception as e: print(f"Warning: Error processing {abs_path}, skipping: {e}")
+
+            elif isinstance(selection, (list, tuple)): # List/tuple of file paths
+                print(f"Preparing {len(selection)} files.")
+                base_name = f"{len(selection)} File{'s' if len(selection) != 1 else ''}"
+                for file_path_str in selection:
+                    file_path = Path(file_path_str).resolve()
+                    try:
+                        if file_path.is_file() and os.access(str(file_path), os.R_OK):
+                            file_size = file_path.stat().st_size
+                            # Use filename as relative path for directly selected files
+                            files_to_send.append((str(file_path), file_path.name))
+                            total_size += file_size
+                        else: print(f"Warning: Skipping item (not a readable file): {file_path}")
+                    except OSError as e: print(f"Warning: Cannot access/stat {file_path}, skipping: {e}")
+                    except Exception as e: print(f"Warning: Error processing {file_path}, skipping: {e}")
+            else: # Should not happen with UI logic
+                raise TypeError(f"Invalid selection type for multi-transfer: {type(selection)}")
+
+            if not files_to_send: # Check if any valid files were found
+                print("Warning: No valid, readable files found in the selection.")
+                if self.main_window: self.main_window.show_error("Send Error", "No valid/readable files found in selection.")
+                return None
+
+            return {'files': files_to_send, 'count': len(files_to_send), 'size': total_size, 'base_name': base_name}
+
+        except Exception as e: # Catch errors during preparation (permissions, etc.)
+             print(f"Error preparing file list: {e}")
+             traceback.print_exc()
+             if self.main_window: self.main_window.show_error("Preparation Error", f"Could not prepare file list: {e}")
+             return None
 
 
     def handle_cancel_request(self):
-         """Handles user clicking the Cancel button."""
+         """Signals the active transfer thread to cancel."""
          if self.is_transfer_active and self.current_transfer_cancel_event:
               print("Logic: Handling cancel request.")
-              # Signal the sender/receiver thread via its specific cancel event
               self.current_transfer_cancel_event.set()
-              # Note: If the active transfer is *incoming*, we need to tell the
-              # FileReceiver instance to cancel the specific handler thread.
-              # This current logic primarily cancels outgoing transfers.
-              # A more robust solution might involve storing if the active transfer
-              # is incoming or outgoing. For now, sender cancellation is primary.
-
-              # Update UI immediately
               if self.main_window: self.root.after(0, lambda: self.main_window.update_status("Cancelling transfer..."))
-              # The transfer thread will eventually send an 'error' status with cancellation details
-              # which will call _reset_transfer_state and update buttons finally.
-              # Set is_transfer_active false early? Risky, let the thread confirm cancellation.
-         else:
-              print("Logic: Cancel requested but no active transfer or event.")
+         else: print("Logic: Cancel requested but no active transfer found.")
+
 
     def handle_shutdown(self):
         """Initiates the application shutdown sequence."""
-        if self.stop_event.is_set(): return # Avoid running shutdown twice
+        if self.stop_event.is_set(): return # Already shutting down
         print("AppLogic: Handling shutdown request...")
-        self.stop_event.set() # Signal all main loops FIRST
+        self.stop_event.set() # Signal all threads
 
-        if self.main_window:
-             # Use root.after to ensure UI updates happen before threads might be fully stopped
-             self.root.after(0, lambda: self.main_window.update_button_states(send_enabled=False, cancel_enabled=False))
-             self.root.after(0, lambda: self.main_window.update_status("Shutting down..."))
+        # Update UI
+        if self.main_window and self.root.winfo_exists():
+             try:
+                 self.root.after(0, lambda: self.main_window.update_button_states(False, False))
+                 self.root.after(0, lambda: self.main_window.update_status("Shutting down..."))
+             except tk.TclError: pass # Ignore if UI already gone
 
-        # Ask components to shut down
+        # Ask components to stop
+        print("AppLogic: Shutting down network discovery...")
         self.network_discovery.shutdown()
-        self.file_receiver.shutdown() # This now also signals active transfers to cancel
+        print("AppLogic: Shutting down file receiver...")
+        self.file_receiver.shutdown()
 
+        # Schedule final UI destruction
         print("AppLogic: Scheduling UI destruction.")
-        # Increased delay to allow threads more time to attempt cleanup
-        self.root.after(700, self._destroy_ui) # Longer delay
+        self.root.after(750, self._destroy_ui)
 
     def _destroy_ui(self):
         """Safely destroys the main UI window."""
-        print("AppLogic: Attempting to destroy UI.")
-        if self.main_window:
-            try:
-                # Check if root exists and is valid window before destroying
-                if self.root and self.root.winfo_exists():
-                    self.main_window.destroy_window()
-                else:
-                     print("AppLogic: UI window already destroyed or invalid.")
-            except Exception as e:
-                print(f"Error destroying window during shutdown: {e}")
-        print("AppLogic: UI destruction attempt finished.")
+        print("AppLogic: Attempting to destroy UI...")
+        if self.main_window and self.root and self.root.winfo_exists():
+            try: self.main_window.destroy_window()
+            except Exception as e: print(f"Error destroying window: {e}")
+        else: print("AppLogic: UI window already destroyed or invalid.")
+        print("AppLogic: UI destruction sequence finished.")
