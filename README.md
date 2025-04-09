@@ -1,6 +1,6 @@
 # LanDrop 💧
 
-![LanDrop Icon](landrop/assets/LanDrop.png)
+<img src="landrop/assets/LanDrop.png" alt="LanDrop Icon" width="75">
 
 **LanDrop** is a simple, cross-platform tool for transferring files, folders, and text snippets directly between devices on your local network. It uses Zeroconf (Bonjour/Avahi) for automatic device discovery, eliminating the need to manually enter IP addresses.
 
